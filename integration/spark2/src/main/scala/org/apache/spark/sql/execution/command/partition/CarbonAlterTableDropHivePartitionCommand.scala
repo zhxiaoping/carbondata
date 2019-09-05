@@ -26,8 +26,9 @@ import org.apache.spark.sql.{CarbonEnv, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.execution.command.{AlterTableAddPartitionCommand, AlterTableDropPartitionCommand, AtomicRunnableCommand}
-import org.apache.spark.util.AlterTableUtil
+import org.apache.spark.util.{AlterTableUtil, DataMapUtil}
 
+import org.apache.carbondata.common.exceptions.sql.MalformedCarbonCommandException
 import org.apache.carbondata.common.logging.LogServiceFactory
 import org.apache.carbondata.core.datamap.DataMapStoreManager
 import org.apache.carbondata.core.indexstore.PartitionSpec
@@ -172,7 +173,7 @@ case class CarbonAlterTableDropHivePartitionCommand(
         ""
       }
       val segments = new SegmentStatusManager(table.getAbsoluteTableIdentifier)
-        .getValidAndInvalidSegments.getValidSegments
+        .getValidAndInvalidSegments(table.isChildTable).getValidSegments
       // First drop the partitions from partition mapper files of each segment
       val tuples = new CarbonDropPartitionRDD(sparkSession,
         table.getTablePath,

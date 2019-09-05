@@ -18,11 +18,12 @@
 package org.apache.carbondata.mv.plans.modular
 
 import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression, PredicateHelper, _}
-import org.apache.spark.sql.catalyst.plans.logical.{Distinct, Limit, LogicalPlan, Window}
+import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.execution.datasources.LogicalRelation
 
 import org.apache.carbondata.mv.plans.{Pattern, _}
 import org.apache.carbondata.mv.plans.modular.Flags._
-import org.apache.carbondata.mv.plans.util.{ExtractGroupByModule, ExtractSelectModule, ExtractSelectModuleForWindow, ExtractTableModule, ExtractUnionModule}
+import org.apache.carbondata.mv.plans.util._
 
 object SimpleModularizer extends ModularPatterns {
   def patterns: Seq[Pattern] = {
@@ -118,6 +119,15 @@ abstract class ModularPatterns extends Modularizer[ModularPlan] {
           makeSelectModule(output, input, predicate, aliasmap, joinedge, flags,
             children.map(modularizeLater), Seq(Seq(limitExpr)) ++ fspec1, wspec)
 
+        // if select * is with limit, then projection is removed from plan, so send the parent plan
+        // to ExtractSelectModule to make the select node
+        case limit@Limit(limitExpr, lr: LogicalRelation) =>
+          val (output, input, predicate, aliasmap, joinedge, children, flags1,
+          fspec1, wspec) = ExtractSelectModule.unapply(limit).get
+          val flags = flags1.setFlag(LIMIT)
+          makeSelectModule(output, input, predicate, aliasmap, joinedge, flags,
+            children.map(modularizeLater), Seq(Seq(limitExpr)) ++ fspec1, wspec)
+
         case Limit(
           limitExpr,
           ExtractSelectModule(output, input, predicate, aliasmap, joinedge, children, flags1,
@@ -134,8 +144,11 @@ abstract class ModularPatterns extends Modularizer[ModularPlan] {
         case Window(exprs, _, _,
           ExtractSelectModuleForWindow(output, input, predicate, aliasmap, joinedge, children,
             flags1, fspec1, wspec)) =>
-          val sel1 = makeSelectModule(output, input, predicate, aliasmap, joinedge, flags1,
-            children.map(modularizeLater), fspec1, wspec)
+          val sel1 = plan.asInstanceOf[Window].child match {
+            case agg: Aggregate => children.map (modularizeLater)
+            case other => makeSelectModule (output, input, predicate, aliasmap, joinedge, flags1,
+              children.map (modularizeLater), fspec1, wspec)
+          }
           makeSelectModule(
             output.map(_.toAttribute),
             output.map(_.toAttribute),

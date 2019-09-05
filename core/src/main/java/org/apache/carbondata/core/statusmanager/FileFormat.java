@@ -29,10 +29,6 @@ public enum FileFormat {
   ROW_V1;
 
   public static FileFormat getByOrdinal(int ordinal) {
-    if (ordinal < 0 || ordinal >= FileFormat.values().length) {
-      return COLUMNAR_V3;
-    }
-
     switch (ordinal) {
       case 0:
         return COLUMNAR_V3;

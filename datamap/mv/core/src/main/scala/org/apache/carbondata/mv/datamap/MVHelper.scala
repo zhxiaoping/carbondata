@@ -25,20 +25,24 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.sql.{CarbonEnv, CarbonToSparkAdapter, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Cast, Expression, NamedExpression, ScalaUDF, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Cast, Coalesce, Expression, NamedExpression, ScalaUDF, SortOrder}
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, Project}
-import org.apache.spark.sql.execution.command.{Field, TableModel, TableNewProcessor}
-import org.apache.spark.sql.execution.command.table.CarbonCreateTableCommand
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Join, Limit, LogicalPlan, Project}
+import org.apache.spark.sql.execution.command.{Field, PartitionerField, TableModel, TableNewProcessor}
+import org.apache.spark.sql.execution.command.table.{CarbonCreateTableCommand, CarbonDropTableCommand}
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.parser.CarbonSpark2SqlParser
+import org.apache.spark.sql.types.{ArrayType, MapType, StructType}
+import org.apache.spark.util.{DataMapUtil, PartitionUtils}
 
 import org.apache.carbondata.common.exceptions.sql.MalformedCarbonCommandException
+import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.datamap.DataMapStoreManager
+import org.apache.carbondata.core.datastore.impl.FileFactory
 import org.apache.carbondata.core.metadata.schema.datamap.DataMapClassProvider
-import org.apache.carbondata.core.metadata.schema.table.{DataMapSchema, RelationIdentifier}
+import org.apache.carbondata.core.metadata.schema.table.{CarbonTable, DataMapSchema, RelationIdentifier}
 import org.apache.carbondata.datamap.DataMapManager
-import org.apache.carbondata.mv.plans.modular.{GroupBy, Matchable, ModularPlan, Select}
+import org.apache.carbondata.mv.plans.modular._
 import org.apache.carbondata.mv.rewrite.{MVPlanWrapper, QueryRewrite, SummaryDatasetCatalog}
 import org.apache.carbondata.spark.util.CommonUtil
 
@@ -52,13 +56,42 @@ object MVHelper {
       queryString: String,
       ifNotExistsSet: Boolean = false): Unit = {
     val dmProperties = dataMapSchema.getProperties.asScala
+    if (dmProperties.contains("streaming") && dmProperties("streaming").equalsIgnoreCase("true")) {
+      throw new MalformedCarbonCommandException(
+        s"MV datamap does not support streaming"
+      )
+    }
+    val mvUtil = new MVUtil
+    mvUtil.validateDMProperty(dmProperties)
     val updatedQuery = new CarbonSpark2SqlParser().addPreAggFunction(queryString)
     val query = sparkSession.sql(updatedQuery)
     val logicalPlan = MVHelper.dropDummFuc(query.queryExecution.analyzed)
-    validateMVQuery(sparkSession, logicalPlan)
+    // if there is limit in MV ctas query string, throw exception, as its not a valid usecase
+    logicalPlan match {
+      case Limit(_, _) =>
+        throw new MalformedCarbonCommandException("MV datamap does not support the query with " +
+                                                  "limit")
+      case _ =>
+    }
+    val selectTables = getTables(logicalPlan)
+    if (selectTables.isEmpty) {
+      throw new MalformedCarbonCommandException(
+        s"Non-Carbon table does not support creating MV datamap")
+    }
+    val updatedQueryWithDb = validateMVQuery(sparkSession, logicalPlan)
     val fullRebuild = isFullReload(logicalPlan)
+    var counter = 0
+    // the ctas query can have duplicate columns, so we should take distinct and create fields,
+    // so that it won't fail during create mv table
     val fields = logicalPlan.output.map { attr =>
-      val name = updateColumnName(attr)
+      if (attr.dataType.isInstanceOf[ArrayType] || attr.dataType.isInstanceOf[StructType] ||
+          attr.dataType.isInstanceOf[MapType]) {
+        throw new UnsupportedOperationException(
+          s"MV datamap is not supported for complex datatype columns and complex datatype return " +
+          s"types of function :" + attr.name)
+      }
+      val name = updateColumnName(attr, counter)
+      counter += 1
       val rawSchema = '`' + name + '`' + ' ' + attr.dataType.typeName
       if (attr.dataType.typeName.startsWith("decimal")) {
         val (precision, scale) = CommonUtil.getScaleAndPrecision(attr.dataType.catalogString)
@@ -76,28 +109,76 @@ object MVHelper {
           children = None,
           rawSchema = rawSchema)
       }
-    }
-    val tableProperties = mutable.Map[String, String]()
-    dmProperties.foreach(t => tableProperties.put(t._1, t._2))
+    }.distinct
 
-    val selectTables = getTables(logicalPlan)
+    val tableProperties = mutable.Map[String, String]()
+    val parentTables = new util.ArrayList[String]()
+    val parentTablesList = new util.ArrayList[CarbonTable](selectTables.size)
     selectTables.foreach { selectTable =>
       val mainCarbonTable = try {
         Some(CarbonEnv.getCarbonTable(selectTable.identifier.database,
           selectTable.identifier.table)(sparkSession))
       } catch {
         // Exception handling if it's not a CarbonTable
-        case ex : Exception => None
+        case ex: Exception =>
+          throw new MalformedCarbonCommandException(
+            s"Non-Carbon table does not support creating MV datamap")
       }
-
+      if (!mainCarbonTable.get.getTableInfo.isTransactionalTable) {
+        throw new MalformedCarbonCommandException("Unsupported operation on NonTransactional table")
+      }
+      if (mainCarbonTable.get.isChildTable || mainCarbonTable.get.isChildDataMap) {
+        throw new MalformedCarbonCommandException(
+          "Cannot create Datamap on child table " + mainCarbonTable.get.getTableUniqueName)
+      }
+      parentTables.add(mainCarbonTable.get.getTableName)
       if (!mainCarbonTable.isEmpty && mainCarbonTable.get.isStreamingSink) {
         throw new MalformedCarbonCommandException(
           s"Streaming table does not support creating MV datamap")
       }
+      parentTablesList.add(mainCarbonTable.get)
+    }
+    tableProperties.put(CarbonCommonConstants.DATAMAP_NAME, dataMapSchema.getDataMapName)
+    tableProperties.put(CarbonCommonConstants.PARENT_TABLES, parentTables.asScala.mkString(","))
+
+    val fieldRelationMap = mvUtil.getFieldsAndDataMapFieldsFromPlan(
+      logicalPlan, queryString, sparkSession)
+    // If dataMap is mapped to single main table, then inherit table properties from main table,
+    // else, will use default table properties. If DMProperties contains table properties, then
+    // table properties of datamap table will be updated
+    if (parentTablesList.size() == 1) {
+      DataMapUtil
+        .inheritTablePropertiesFromMainTable(parentTablesList.get(0),
+          fields,
+          fieldRelationMap,
+          tableProperties)
+    }
+    dmProperties.foreach(t => tableProperties.put(t._1, t._2))
+    val usePartitioning = dmProperties.getOrElse("partitioning", "true").toBoolean
+    var partitionerFields: Seq[PartitionerField] = Seq.empty
+    // Inherit partition from parent table if datamap is mapped to single parent table
+    if (parentTablesList.size() == 1) {
+      val partitionInfo = parentTablesList.get(0).getPartitionInfo
+      val parentPartitionColumns = if (!usePartitioning) {
+        Seq.empty
+      } else if (parentTablesList.get(0).isHivePartitionTable) {
+        partitionInfo.getColumnSchemaList.asScala.map(_.getColumnName)
+      } else {
+        Seq()
+      }
+      partitionerFields = PartitionUtils
+        .getPartitionerFields(parentPartitionColumns, fieldRelationMap)
     }
 
-    // TODO inherit the table properties like sort order, sort scope and block size from parent
-    // tables to mv datamap table
+    var order = 0
+    val columnOrderMap = new java.util.HashMap[Integer, String]()
+    if (partitionerFields.nonEmpty) {
+      fields.foreach { field =>
+        columnOrderMap.put(order, field.column)
+        order += 1
+      }
+    }
+
     // TODO Use a proper DB
     val tableIdentifier =
     TableIdentifier(dataMapSchema.getDataMapName + "_table",
@@ -108,7 +189,7 @@ object MVHelper {
       new CarbonSpark2SqlParser().convertDbNameToLowerCase(tableIdentifier.database),
       tableIdentifier.table.toLowerCase,
       fields,
-      Seq(),
+      partitionerFields,
       tableProperties,
       None,
       isAlterFlow = false,
@@ -123,22 +204,88 @@ object MVHelper {
     CarbonCreateTableCommand(TableNewProcessor(tableModel),
       tableModel.ifNotExistsSet, Some(tablePath), isVisible = false).run(sparkSession)
 
-    dataMapSchema.setCtasQuery(queryString)
+    // Map list of main table columns mapped to datamap table and add to dataMapSchema
+    val mainTableToColumnsMap = new java.util.HashMap[String, util.Set[String]]()
+    val mainTableFieldIterator = fieldRelationMap.values.asJava.iterator()
+    while (mainTableFieldIterator.hasNext) {
+      val value = mainTableFieldIterator.next()
+      value.columnTableRelationList.foreach {
+        columnTableRelation =>
+          columnTableRelation.foreach {
+            mainTable =>
+              if (null == mainTableToColumnsMap.get(mainTable.parentTableName)) {
+                val columns = new util.HashSet[String]()
+                columns.add(mainTable.parentColumnName)
+                mainTableToColumnsMap.put(mainTable.parentTableName, columns)
+              } else {
+                mainTableToColumnsMap.get(mainTable.parentTableName)
+                  .add(mainTable.parentColumnName)
+              }
+          }
+      }
+    }
+    dataMapSchema.setMainTableColumnList(mainTableToColumnsMap)
+    dataMapSchema.setColumnsOrderMap(columnOrderMap)
+    dataMapSchema.setCtasQuery(updatedQueryWithDb)
     dataMapSchema
       .setRelationIdentifier(new RelationIdentifier(tableIdentifier.database.get,
         tableIdentifier.table,
-        ""))
+        CarbonEnv.getCarbonTable(tableIdentifier)(sparkSession).getTableId))
 
     val parentIdents = selectTables.map { table =>
-      new RelationIdentifier(table.database, table.identifier.table, "")
+      val relationIdentifier = new RelationIdentifier(table.database, table.identifier.table, "")
+      relationIdentifier.setTablePath(FileFactory.getUpdatedFilePath(table.location.toString))
+      relationIdentifier
     }
+    dataMapSchema.getRelationIdentifier.setTablePath(tablePath)
     dataMapSchema.setParentTables(new util.ArrayList[RelationIdentifier](parentIdents.asJava))
     dataMapSchema.getProperties.put("full_refresh", fullRebuild.toString)
-    DataMapStoreManager.getInstance().saveDataMapSchema(dataMapSchema)
+    try {
+      DataMapStoreManager.getInstance().saveDataMapSchema(dataMapSchema)
+    } catch {
+      case ex: Exception =>
+        val dropTableCommand = CarbonDropTableCommand(true,
+          new Some[String](dataMapSchema.getRelationIdentifier.getDatabaseName),
+          dataMapSchema.getRelationIdentifier.getTableName,
+          true)
+        dropTableCommand.run(sparkSession)
+        throw ex
+    }
+  }
+
+  private def isValidSelect(isValidExp: Boolean,
+      s: Select): Boolean = {
+    // Make sure all predicates are present in projections.
+    var predicateList: Seq[AttributeReference] = Seq.empty
+    s.predicateList.map { f =>
+      f.children.collect {
+        case p: AttributeReference =>
+          predicateList = predicateList.+:(p)
+        case e: Expression =>
+          e.collect {
+            case attr: AttributeReference =>
+              predicateList = predicateList.+:(attr)
+          }
+      }
+    }
+    if (predicateList.nonEmpty) {
+      predicateList.forall { p =>
+        s.outputList.exists {
+          case a: Alias =>
+            a.semanticEquals(p) || a.child.semanticEquals(p) || a.collect {
+              case attr: AttributeReference =>
+                attr.semanticEquals(p)
+            }.exists(p => p.equals(true))
+          case other => other.semanticEquals(p)
+        }
+      }
+    } else {
+      isValidExp
+    }
   }
 
   private def validateMVQuery(sparkSession: SparkSession,
-      logicalPlan: LogicalPlan): Unit = {
+      logicalPlan: LogicalPlan): String = {
     val dataMapProvider = DataMapManager.get().getDataMapProvider(null,
       new DataMapSchema("", DataMapClassProvider.MV.getShortName), sparkSession)
     var catalog = DataMapStoreManager.getInstance().getDataMapCatalog(dataMapProvider,
@@ -157,30 +304,60 @@ object MVHelper {
     val isValid = modularPlan match {
       case g: GroupBy =>
         // Make sure all predicates are present in projections.
-        g.predicateList.forall{p =>
+        val isValidExp = g.predicateList.forall{p =>
           g.outputList.exists{
             case a: Alias =>
               a.semanticEquals(p) || a.child.semanticEquals(p)
             case other => other.semanticEquals(p)
           }
         }
+        g.child match {
+          case s: Select =>
+            isValidSelect(isValidExp, s)
+          case m: ModularRelation => isValidExp
+        }
+      case s: Select =>
+        isValidSelect(true, s)
       case _ => true
     }
     if (!isValid) {
-      throw new UnsupportedOperationException("Group by columns must be present in project columns")
+      throw new UnsupportedOperationException(
+        "Group by/Filter columns must be present in project columns")
     }
     if (catalog.isMVWithSameQueryPresent(logicalPlan)) {
       throw new UnsupportedOperationException("MV with same query present")
     }
+
+    var expressionValid = true
+    modularPlan.transformExpressions {
+      case coal@Coalesce(_) if coal.children.exists(
+        exp => exp.isInstanceOf[AggregateExpression]) =>
+        expressionValid = false
+        coal
+    }
+
+    if (!expressionValid) {
+      throw new UnsupportedOperationException("MV doesn't support Coalesce")
+    }
+    modularPlan.asCompactSQL
   }
 
-  def updateColumnName(attr: Attribute): String = {
-    val name =
-      attr.name.replace("(", "_")
-        .replace(")", "")
-        .replace(" ", "_")
-        .replace("=", "")
-        .replace(",", "")
+  def getUpdatedName(name: String, counter: Int): String = {
+    var updatedName = name.replace("(", "_")
+      .replace(")", "")
+      .replace(" ", "_")
+      .replace("=", "")
+      .replace(",", "")
+      .replace(".", "_")
+      .replace("`", "")
+    if (updatedName.length >= CarbonCommonConstants.MAXIMUM_CHAR_LENGTH) {
+      updatedName = updatedName.substring(0, 110) + CarbonCommonConstants.UNDERSCORE + counter
+    }
+    updatedName
+  }
+
+  def updateColumnName(attr: Attribute, counter: Int): String = {
+    val name = getUpdatedName(attr.name, counter)
     attr.qualifier.map(qualifier => qualifier + "_" + name).getOrElse(name)
   }
 
@@ -241,12 +418,20 @@ object MVHelper {
         }.isDefined || isFullReload
         exp
     }
+    // TODO:- Remove this case when incremental datalaoding is supported for multiple tables
+    logicalPlan.transformDown {
+      case join@Join(l1, l2, jointype, condition) =>
+        isFullReload = true
+        join
+    }
     isFullReload
   }
 
   def getAttributeMap(subsumer: Seq[NamedExpression],
       subsume: Seq[NamedExpression]): Map[AttributeKey, NamedExpression] = {
-    if (subsumer.length == subsume.length) {
+    // when datamap is created with duplicate columns like select sum(age),sum(age) from table,
+    // the subsumee will have duplicate, so handle that case here
+    if (subsumer.length == subsume.groupBy(_.name).size) {
       subsume.zip(subsumer).flatMap { case (left, right) =>
         var tuples = left collect {
           case attr: AttributeReference =>
@@ -413,7 +598,10 @@ object MVHelper {
       case s: Select if s.dataMapTableRelation.isDefined =>
         val relation =
           s.dataMapTableRelation.get.asInstanceOf[MVPlanWrapper].plan.asInstanceOf[Select]
-        val mappings = s.outputList zip relation.outputList
+        val outputList = getUpdatedOutputList(relation.outputList, s.dataMapTableRelation)
+        // when the output list contains multiple projection of same column, but relation
+        // contains distinct columns, mapping may go wrong with columns, so select distinct
+        val mappings = s.outputList.distinct zip outputList
         val oList = for ((o1, o2) <- mappings) yield {
           if (o1.name != o2.name) Alias(o2, o1.name)(exprId = o1.exprId) else o2
         }
@@ -422,7 +610,8 @@ object MVHelper {
         val relation =
           g.dataMapTableRelation.get.asInstanceOf[MVPlanWrapper].plan.asInstanceOf[Select]
         val in = relation.asInstanceOf[Select].outputList
-        val mappings = g.outputList zip relation.outputList
+        val outputList = getUpdatedOutputList(relation.outputList, g.dataMapTableRelation)
+        val mappings = g.outputList zip outputList
         val oList = for ((left, right) <- mappings) yield {
           left match {
             case Alias(agg@AggregateExpression(fun@Sum(child), _, _, _), name) =>
@@ -473,7 +662,8 @@ object MVHelper {
               relation,
               aliasMap)
             if (isFullRefresh(g.dataMapTableRelation.get.asInstanceOf[MVPlanWrapper])) {
-              val mappings = g.outputList zip relation.outputList
+              val outputList = getUpdatedOutputList(relation.outputList, g.dataMapTableRelation)
+              val mappings = g.outputList zip outputList
               val oList = for ((o1, o2) <- mappings) yield {
                 if (o1.name != o2.name) Alias(o2, o1.name)(exprId = o1.exprId) else o2
               }
@@ -547,7 +737,7 @@ object MVHelper {
                 relation,
                 aliasMap,
                 keepAlias = false)
-            SortOrder(expressions.head, s.direction, s.sameOrderExpressions)
+            SortOrder(expressions.head, s.direction)
           }
         // In case of limit it goes to other.
         case other => other
@@ -596,16 +786,32 @@ object MVHelper {
         case g: GroupBy =>
           MVHelper.updateDataMap(g, rewrite)
       }
-      // TODO Find a better way to set the rewritten flag, it may fail in some conditions.
-      val mapping =
-        rewrittenPlan.collect { case m: ModularPlan => m } zip
-        updatedDataMapTablePlan.collect { case m: ModularPlan => m }
-      mapping.foreach(f => if (f._1.rewritten) f._2.setRewritten())
-
       updatedDataMapTablePlan
     } else {
       rewrittenPlan
     }
+  }
+
+  private def getUpdatedOutputList(outputList: Seq[NamedExpression],
+      dataMapTableRelation: Option[ModularPlan]): Seq[NamedExpression] = {
+    dataMapTableRelation.collect {
+      case mv: MVPlanWrapper =>
+        val dataMapSchema = mv.dataMapSchema
+        val columnsOrderMap = dataMapSchema.getColumnsOrderMap
+        if (null != columnsOrderMap && !columnsOrderMap.isEmpty) {
+          val updatedOutputList = new util.ArrayList[NamedExpression]()
+          var i = 0
+          while (i < columnsOrderMap.size()) {
+            updatedOutputList
+              .add(outputList.filter(f => f.name.equalsIgnoreCase(columnsOrderMap.get(i))).head)
+            i = i + 1
+          }
+          updatedOutputList.asScala
+        } else {
+          outputList
+        }
+      case _ => outputList
+    }.get
   }
 }
 

@@ -38,12 +38,12 @@ case class CarbonDictionaryCatalystDecoder(
   override def output: Seq[Attribute] = {
     child match {
       case l: LogicalRelation =>
-        // If the child is logical plan then firts update all dictionary attr with IntegerType
+        // If the child is logical plan then first update all dictionary attr with IntegerType
         val logicalOut =
           CarbonDictionaryDecoder.updateAttributes(child.output, relations, aliasMap)
         CarbonDictionaryDecoder.convertOutput(logicalOut, relations, profile, aliasMap)
       case Filter(cond, l: LogicalRelation) =>
-        // If the child is logical plan then firts update all dictionary attr with IntegerType
+        // If the child is logical plan then first update all dictionary attr with IntegerType
         val logicalOut =
           CarbonDictionaryDecoder.updateAttributes(child.output, relations, aliasMap)
         CarbonDictionaryDecoder.convertOutput(logicalOut, relations, profile, aliasMap)
@@ -68,8 +68,8 @@ case class ExcludeProfile(attributes: Seq[Attribute]) extends CarbonProfile(attr
 case class ProjectForUpdate(
     table: UnresolvedRelation,
     columns: List[String],
-    children: Seq[LogicalPlan] ) extends LogicalPlan {
-  override def output: Seq[AttributeReference] = Seq.empty
+    children: Seq[LogicalPlan]) extends LogicalPlan {
+  override def output: Seq[Attribute] = Seq.empty
 }
 
 case class UpdateTable(
@@ -79,7 +79,7 @@ case class UpdateTable(
     alias: Option[String] = None,
     filer: String) extends LogicalPlan {
   override def children: Seq[LogicalPlan] = Seq.empty
-  override def output: Seq[AttributeReference] = Seq.empty
+  override def output: Seq[Attribute] = Seq.empty
 }
 
 case class DeleteRecords(
@@ -177,6 +177,9 @@ object CountStarPlan {
       partialComputation: Seq[NamedExpression],
       child: LogicalPlan): Boolean = {
     if (groupingExpressions.nonEmpty) {
+      return false
+    }
+    if (partialComputation.isEmpty) {
       return false
     }
     if (partialComputation.size > 1 && partialComputation.nonEmpty) {

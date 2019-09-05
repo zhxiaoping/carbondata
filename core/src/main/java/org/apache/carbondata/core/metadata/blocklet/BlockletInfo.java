@@ -31,6 +31,7 @@ import java.util.List;
 import org.apache.carbondata.core.metadata.blocklet.datachunk.DataChunk;
 import org.apache.carbondata.core.metadata.blocklet.index.BlockletIndex;
 
+import org.apache.commons.io.input.ClassLoaderObjectInputStream;
 import org.apache.hadoop.io.Writable;
 
 /**
@@ -229,6 +230,15 @@ public class BlockletInfo implements Serializable, Writable {
     if (isSortedPresent) {
       output.writeBoolean(isSorted);
     }
+    if (null != getNumberOfRowsPerPage()) {
+      output.writeShort(getNumberOfRowsPerPage().length);
+      for (int i = 0; i < getNumberOfRowsPerPage().length; i++) {
+        output.writeInt(getNumberOfRowsPerPage()[i]);
+      }
+    } else {
+      //for old store
+      output.writeShort(0);
+    }
   }
 
   /**
@@ -261,7 +271,8 @@ public class BlockletInfo implements Serializable, Writable {
 
   private DataChunk deserializeDataChunk(byte[] bytes) throws IOException {
     ByteArrayInputStream stream = new ByteArrayInputStream(bytes);
-    ObjectInputStream inputStream = new ObjectInputStream(stream);
+    ObjectInputStream inputStream =
+        new ClassLoaderObjectInputStream(Thread.currentThread().getContextClassLoader(), stream);
     DataChunk dataChunk = null;
     try {
       dataChunk = (DataChunk) inputStream.readObject();
@@ -298,6 +309,14 @@ public class BlockletInfo implements Serializable, Writable {
     final boolean isSortedPresent = input.readBoolean();
     if (isSortedPresent) {
       this.isSorted = input.readBoolean();
+    }
+    short pageCount = input.readShort();
+    if (pageCount != 0) {
+      // should set only for new store, old store will be set via setNumberOfRowsPerPage
+      numberOfRowsPerPage = new int[pageCount];
+      for (int i = 0; i < numberOfRowsPerPage.length; i++) {
+        numberOfRowsPerPage[i] = input.readInt();
+      }
     }
   }
 

@@ -67,7 +67,6 @@ case class CarbonDropDataMapCommand(
       val carbonEnv = CarbonEnv.getInstance(sparkSession)
       val catalog = carbonEnv.carbonMetaStore
       val tablePath = CarbonEnv.getTablePath(databaseNameOp, tableName)(sparkSession)
-      catalog.checkSchemasModifiedTimeAndReloadTable(TableIdentifier(tableName, Some(dbName)))
       if (mainTable == null) {
         mainTable = try {
           CarbonEnv.getCarbonTable(databaseNameOp, tableName)(sparkSession)
@@ -119,6 +118,15 @@ case class CarbonDropDataMapCommand(
           val isDMSchemaExists = DataMapStoreManager.getInstance().getAllDataMap(mainTable).asScala.
             exists(_.getDataMapSchema.getDataMapName.equalsIgnoreCase(dataMapName))
           if (isDMSchemaExists) {
+            dropDataMapFromSystemFolder(sparkSession)
+            return Seq.empty
+          }
+        } else if (mainTable != null) {
+          // If table is defined and datamap is MV datamap, then drop the datamap
+          val dmSchema = DataMapStoreManager.getInstance().getAllDataMapSchemas.asScala
+            .filter(dataMapSchema => dataMapSchema.getDataMapName.equalsIgnoreCase(dataMapName))
+          if (dmSchema.nonEmpty && (!dmSchema.head.isIndexDataMap &&
+                                    null != dmSchema.head.getRelationIdentifier)) {
             dropDataMapFromSystemFolder(sparkSession)
             return Seq.empty
           }

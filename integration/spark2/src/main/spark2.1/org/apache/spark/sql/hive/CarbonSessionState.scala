@@ -36,13 +36,13 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.optimizer.{CarbonIUDRule, CarbonLateDecodeRule, CarbonUDFTransformRule}
 import org.apache.spark.sql.parser.{CarbonHelperSqlAstBuilder, CarbonSpark2SqlParser, CarbonSparkSqlParser, CarbonSparkSqlParserUtil}
 import org.apache.spark.sql.{CarbonDatasourceHadoopRelation, CarbonEnv, ExperimentalMethods, SparkSession, Strategy}
-
 import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.datamap.DataMapStoreManager
 import org.apache.carbondata.core.metadata.AbsoluteTableIdentifier
-import org.apache.carbondata.core.metadata.schema.table.column.{ColumnSchema => ColumnSchema}
+import org.apache.carbondata.core.metadata.schema.table.column.ColumnSchema
 import org.apache.carbondata.core.util.CarbonProperties
 import org.apache.carbondata.spark.util.CarbonScalaUtil
+import org.apache.spark.util.CarbonReflectionUtils
 
 /**
  * This class will have carbon catalog and refresh the relation from cache if the carbontable in
@@ -108,7 +108,7 @@ class CarbonHiveSessionCatalog(
   }
 
   // Initialize all listeners to the Operation bus.
-  CarbonEnv.init(sparkSession)
+  CarbonEnv.init
 
   /**
    * This method will invalidate carbonrelation from cache if carbon table is updated in
@@ -125,9 +125,9 @@ class CarbonHiveSessionCatalog(
     rtnRelation match {
       case SubqueryAlias(_,
       LogicalRelation(carbonDatasourceHadoopRelation: CarbonDatasourceHadoopRelation, _, _), _) =>
-        toRefreshRelation = refreshRelationFromCache(name, alias, carbonDatasourceHadoopRelation)
-      case LogicalRelation(carbonDatasourceHadoopRelation: CarbonDatasourceHadoopRelation, _, _) =>
-        toRefreshRelation = refreshRelationFromCache(name, alias, carbonDatasourceHadoopRelation)
+        toRefreshRelation = CarbonEnv.isRefreshRequired(name)(sparkSession)
+      case LogicalRelation(_: CarbonDatasourceHadoopRelation, _, _) =>
+        toRefreshRelation = CarbonEnv.isRefreshRequired(name)(sparkSession)
       case _ =>
     }
 
@@ -136,31 +136,6 @@ class CarbonHiveSessionCatalog(
     } else {
       rtnRelation
     }
-  }
-
-  private def refreshRelationFromCache(identifier: TableIdentifier,
-      alias: Option[String],
-      carbonDatasourceHadoopRelation: CarbonDatasourceHadoopRelation): Boolean = {
-    var isRefreshed = false
-    val storePath = CarbonProperties.getStorePath
-    carbonEnv.carbonMetaStore.
-      checkSchemasModifiedTimeAndReloadTable(identifier)
-
-    val table = carbonEnv.carbonMetaStore.getTableFromMetadataCache(
-      carbonDatasourceHadoopRelation.carbonTable.getDatabaseName,
-      carbonDatasourceHadoopRelation.carbonTable.getTableName)
-    if (table.isEmpty || (table.isDefined &&
-        table.get.getTableLastUpdatedTime !=
-          carbonDatasourceHadoopRelation.carbonTable.getTableLastUpdatedTime)) {
-      refreshTable(identifier)
-      DataMapStoreManager.getInstance().
-        clearDataMaps(AbsoluteTableIdentifier.from(storePath,
-          identifier.database.getOrElse("default"),
-          identifier.table))
-      isRefreshed = true
-      logInfo(s"Schema changes have been detected for table: $identifier")
-    }
-    isRefreshed
   }
 
   /**
@@ -301,10 +276,25 @@ class CarbonAnalyzer(catalog: SessionCatalog,
     conf: CatalystConf,
     sparkSession: SparkSession,
     analyzer: Analyzer) extends Analyzer(catalog, conf) {
+
+  val mvPlan = try {
+    CarbonReflectionUtils.createObject(
+      "org.apache.carbondata.mv.datamap.MVAnalyzerRule",
+      sparkSession)._1.asInstanceOf[Rule[LogicalPlan]]
+  } catch {
+    case e: Exception =>
+      null
+  }
+
   override def execute(plan: LogicalPlan): LogicalPlan = {
     var logicalPlan = analyzer.execute(plan)
     logicalPlan = CarbonPreAggregateDataLoadingRules(sparkSession).apply(logicalPlan)
     CarbonPreAggregateQueryRules(sparkSession).apply(logicalPlan)
+    if (mvPlan != null) {
+      mvPlan.apply(logicalPlan)
+    } else {
+      logicalPlan
+    }
   }
 }
 

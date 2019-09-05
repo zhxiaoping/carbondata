@@ -18,29 +18,30 @@
 package org.apache.spark.sql.hive
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable
 
 import org.apache.spark.SPARK_VERSION
 import org.apache.spark.sql._
 import org.apache.spark.sql.CarbonExpressions.CarbonUnresolvedRelation
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAlias, UnresolvedAttribute, UnresolvedFunction, UnresolvedRelation, UnresolvedStar}
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Cast, NamedExpression}
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
 import org.apache.spark.sql.execution.command.mutation.CarbonProjectForDeleteCommand
 import org.apache.spark.sql.execution.datasources.{CatalogFileIndex, FileFormat, HadoopFsRelation, LogicalRelation, SparkCarbonTableFormat}
-import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CarbonException
-import org.apache.spark.util.{CarbonReflectionUtils, SparkUtil}
+import org.apache.spark.util.{CarbonReflectionUtils, DataMapUtil, SparkUtil}
 
 import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.datamap.DataMapStoreManager
+import org.apache.carbondata.core.datamap.status.DataMapStatusManager
 import org.apache.carbondata.core.util.CarbonUtil
 
 case class CarbonIUDAnalysisRule(sparkSession: SparkSession) extends Rule[LogicalPlan] {
 
   private lazy val parser = sparkSession.sessionState.sqlParser
+  private lazy val optimizer = sparkSession.sessionState.optimizer
+  private lazy val analyzer = sparkSession.sessionState.analyzer
 
   private def processUpdateQuery(
       table: UnresolvedRelation,
@@ -69,9 +70,21 @@ case class CarbonIUDAnalysisRule(sparkSession: SparkSession) extends Rule[Logica
             "Update operation is not supported for pre-aggregate table")
         }
         val indexSchemas = DataMapStoreManager.getInstance().getDataMapSchemasOfTable(carbonTable)
-        if (!indexSchemas.isEmpty) {
+        if (DataMapUtil.hasMVDataMap(carbonTable)) {
+          val allDataMapSchemas = DataMapStoreManager.getInstance
+            .getDataMapSchemasOfTable(carbonTable).asScala
+            .filter(dataMapSchema => null != dataMapSchema.getRelationIdentifier &&
+                                     !dataMapSchema.isIndexDataMap).asJava
+          allDataMapSchemas.asScala.foreach { dataMapSchema =>
+            DataMapStatusManager.disableDataMap(dataMapSchema.getDataMapName)
+          }
+        } else if (!indexSchemas.isEmpty) {
           throw new UnsupportedOperationException(
             "Update operation is not supported for table which has index datamaps")
+        }
+        if (carbonTable.isChildTable) {
+          throw new UnsupportedOperationException(
+            "Update operation is not supported for mv datamap table")
         }
       }
       val tableRelation = if (SparkUtil.isSparkVersionEqualTo("2.1")) {
@@ -170,7 +183,15 @@ case class CarbonIUDAnalysisRule(sparkSession: SparkSession) extends Rule[Logica
     }
     val destinationTable = CarbonReflectionUtils.getUnresolvedRelation(table.tableIdentifier, alias)
 
-    ProjectForUpdate(destinationTable, columns, Seq(finalPlan))
+    // In Spark 2.1 and 2.2, it uses Analyzer.execute method to transform LogicalPlan
+    // but in Spark 2.3, it uses Analyzer.executeAndCheck method
+    val analyzedPlan = CarbonReflectionUtils.invokeAnalyzerExecute(
+        analyzer, ProjectForUpdate(destinationTable, columns, Seq(finalPlan)))
+    // For all commands, they execute eagerly, and will be transformed to
+    // logical plan 'LocalRelation' in analyze phase(please see the code in 'Dataset.logicalPlan'),
+    // so it needs to return logical plan 'CarbonProjectForUpdateCommand' here
+    // instead of 'ProjectForUpdate'
+    optimizer.execute(analyzedPlan)
   }
 
 
@@ -190,17 +211,20 @@ case class CarbonIUDAnalysisRule(sparkSession: SparkSession) extends Rule[Logica
         val projList = Seq(UnresolvedAlias(UnresolvedStar(alias.map(Seq(_)))), tupleId)
         val carbonTable = CarbonEnv.getCarbonTable(table.tableIdentifier)(sparkSession)
         if (carbonTable != null) {
-          if (CarbonUtil.hasAggregationDataMap(carbonTable)) {
+          if (carbonTable.isChildTable) {
             throw new UnsupportedOperationException(
-              "Delete operation is not supported for tables which have a pre-aggregate table. " +
-              "Drop pre-aggregate tables to continue.")
-          }
-          if (carbonTable.isChildDataMap) {
-            throw new UnsupportedOperationException(
-              "Delete operation is not supported for pre-aggregate table")
+              "Delete operation is not supported for datamap table")
           }
           val indexSchemas = DataMapStoreManager.getInstance().getDataMapSchemasOfTable(carbonTable)
-          if (!indexSchemas.isEmpty) {
+          if (DataMapUtil.hasMVDataMap(carbonTable)) {
+            val allDataMapSchemas = DataMapStoreManager.getInstance
+              .getDataMapSchemasOfTable(carbonTable).asScala
+              .filter(dataMapSchema => null != dataMapSchema.getRelationIdentifier &&
+                                       !dataMapSchema.isIndexDataMap).asJava
+            allDataMapSchemas.asScala.foreach { dataMapSchema =>
+              DataMapStatusManager.disableDataMap(dataMapSchema.getDataMapName)
+            }
+          } else if (!indexSchemas.isEmpty) {
             throw new UnsupportedOperationException(
               "Delete operation is not supported for table which has index datamaps")
           }
@@ -268,9 +292,30 @@ case class CarbonPreInsertionCasts(sparkSession: SparkSession) extends Rule[Logi
         s"Maximum number of columns supported: " +
           s"${CarbonCommonConstants.DEFAULT_MAX_NUMBER_OF_COLUMNS}")
     }
-    if (child.output.size >= carbonDSRelation.carbonRelation.output.size ||
+    // In spark, PreprocessTableInsertion rule has below cast logic.
+    // It was missed in carbon when implemented insert into rules.
+    var newChildOutput = if (child.output.size >= carbonDSRelation.carbonRelation.output.size) {
+      val expectedOutput = carbonDSRelation.carbonRelation.output
+      child.output.zip(expectedOutput).map {
+        case (actual, expected) =>
+          if (expected.dataType.sameType(actual.dataType) &&
+              expected.name == actual.name &&
+              expected.metadata == actual.metadata) {
+            actual
+          } else {
+            // Renaming is needed for handling the following cases like
+            // 1) Column names/types do not match, e.g., INSERT INTO TABLE tab1 SELECT 1, 2
+            // 2) Target tables have column metadata
+            Alias(Cast(actual, expected.dataType), expected.name)(
+              explicitMetadata = Option(expected.metadata))
+          }
+      }
+    } else {
+      child.output
+    }
+    if (newChildOutput.size >= carbonDSRelation.carbonRelation.output.size ||
         carbonDSRelation.carbonTable.isHivePartitionTable) {
-      val newChildOutput = child.output.zipWithIndex.map { columnWithIndex =>
+      newChildOutput = newChildOutput.zipWithIndex.map { columnWithIndex =>
         columnWithIndex._1 match {
           case attr: Attribute =>
             Alias(attr, s"col${ columnWithIndex._2 }")(NamedExpression.newExprId)

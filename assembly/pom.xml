@@ -61,6 +61,16 @@
       <artifactId>carbondata-spark2</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <dependency>
+      <groupId>org.apache.carbondata</groupId>
+      <artifactId>carbondata-mv-plan</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.carbondata</groupId>
+      <artifactId>carbondata-mv-core</artifactId>
+      <version>${project.version}</version>
+    </dependency>
   </dependencies>
 
   <build>
@@ -97,6 +107,7 @@
               <exclude>org.apache.spark:*</exclude>
               <exclude>org.apache.zookeeper:*</exclude>
               <exclude>org.apache.avro:*</exclude>
+              <exclude>org.apache.hive:*</exclude>
               <exclude>com.google.guava:guava</exclude>
               <exclude>org.xerial.snappy:snappy-java</exclude>
               <!--add more items to be excluded from the assembly-->
@@ -176,21 +187,6 @@
           </plugin>
         </plugins>
       </build>
-    </profile>
-    <profile>
-      <id>mv</id>
-      <dependencies>
-        <dependency>
-          <groupId>org.apache.carbondata</groupId>
-          <artifactId>carbondata-mv-plan</artifactId>
-          <version>${project.version}</version>
-        </dependency>
-        <dependency>
-          <groupId>org.apache.carbondata</groupId>
-          <artifactId>carbondata-mv-core</artifactId>
-          <version>${project.version}</version>
-        </dependency>
-      </dependencies>
     </profile>
   </profiles>
 

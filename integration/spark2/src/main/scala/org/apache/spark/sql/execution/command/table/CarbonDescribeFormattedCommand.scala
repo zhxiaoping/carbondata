@@ -32,6 +32,7 @@ import org.apache.spark.sql.hive.CarbonRelation
 import org.apache.carbondata.common.Strings
 import org.apache.carbondata.core.constants.{CarbonCommonConstants, CarbonLoadOptionConstants}
 import org.apache.carbondata.core.metadata.datatype.DataTypes
+import org.apache.carbondata.core.metadata.schema.PartitionInfo
 import org.apache.carbondata.core.metadata.schema.partition.PartitionType
 import org.apache.carbondata.core.metadata.schema.table.CarbonTable
 import org.apache.carbondata.core.util.{CarbonProperties, CarbonUtil}
@@ -82,6 +83,12 @@ private[sql] case class CarbonDescribeFormattedCommand(
     val catalog = sparkSession.sessionState.catalog
     val catalogTable = catalog.getTableMetadata(tblIdentifier)
 
+    val pageSizeInMb: String = if (tblProps.get(CarbonCommonConstants.TABLE_PAGE_SIZE_INMB)
+      .isDefined) {
+      tblProps(CarbonCommonConstants.TABLE_PAGE_SIZE_INMB)
+    } else {
+      ""
+    }
     //////////////////////////////////////////////////////////////////////////////
     // Table Basic Information
     //////////////////////////////////////////////////////////////////////////////
@@ -106,7 +113,9 @@ private[sql] case class CarbonDescribeFormattedCommand(
             CarbonCommonConstants.CARBON_LOAD_MIN_SIZE_INMB_DEFAULT).toFloat), ""),
       ("Data File Compressor ", tblProps
         .getOrElse(CarbonCommonConstants.COMPRESSOR,
-          CarbonCommonConstants.DEFAULT_COMPRESSOR), ""),
+          CarbonProperties.getInstance()
+            .getProperty(CarbonCommonConstants.COMPRESSOR,
+          CarbonCommonConstants.DEFAULT_COMPRESSOR)), ""),
       //////////////////////////////////////////////////////////////////////////////
       //  Index Information
       //////////////////////////////////////////////////////////////////////////////
@@ -115,15 +124,18 @@ private[sql] case class CarbonDescribeFormattedCommand(
       ("## Index Information", "", ""),
       ("Sort Scope", sortScope, ""),
       ("Sort Columns", relation.metaData.carbonTable.getSortColumns.asScala.mkString(", "), ""),
-      ("Inverted Index Columns", carbonTable.getInvertedIndexColumns.asScala
-        .map(_.getColumnName).mkString(", "), ""),
+      ("Inverted Index Columns", carbonTable.getTableInfo.getFactTable.getTableProperties.asScala
+        .getOrElse(CarbonCommonConstants.INVERTED_INDEX, ""), ""),
       ("Cached Min/Max Index Columns",
         carbonTable.getMinMaxCachedColumnsInCreateOrder.asScala.mkString(", "), ""),
       ("Min/Max Index Cache Level",
         tblProps.getOrElse(CarbonCommonConstants.CACHE_LEVEL,
-          CarbonCommonConstants.CACHE_LEVEL_DEFAULT_VALUE), "")
+          CarbonCommonConstants.CACHE_LEVEL_DEFAULT_VALUE), ""),
+      ("Table page size in mb", pageSizeInMb, "")
     )
-
+    if (carbonTable.getRangeColumn != null) {
+      results ++= Seq(("RANGE COLUMN", carbonTable.getRangeColumn.getColName, ""))
+    }
     //////////////////////////////////////////////////////////////////////////////
     //  Encoding Information
     //////////////////////////////////////////////////////////////////////////////
@@ -185,7 +197,7 @@ private[sql] case class CarbonDescribeFormattedCommand(
         ("Partition Columns",
           partitionInfo.getColumnSchemaList.asScala.map {
             col => s"${col.getColumnName}:${col.getDataType.getName}"}.mkString(", "), ""),
-        ("Number of Partitions", partitionInfo.getNumPartitions.toString, ""),
+        ("Number of Partitions", getNumberOfPartitions(carbonTable, sparkSession), ""),
         ("Partitions Ids", partitionInfo.getPartitionIds.asScala.mkString(","), "")
       )
       if (partitionInfo.getPartitionType == PartitionType.RANGE) {
@@ -237,6 +249,22 @@ private[sql] case class CarbonDescribeFormattedCommand(
     }
 
     results.map{case (c1, c2, c3) => Row(c1, c2, c3)}
+  }
+
+  /**
+   * This method returns the number of partitions based on the partition type
+   */
+  private def getNumberOfPartitions(carbonTable: CarbonTable,
+      sparkSession: SparkSession): String = {
+    val partitionType = carbonTable.getPartitionInfo.getPartitionType
+    partitionType match {
+      case PartitionType.NATIVE_HIVE =>
+        sparkSession.sessionState.catalog
+          .listPartitions(new TableIdentifier(carbonTable.getTableName,
+            Some(carbonTable.getDatabaseName))).size.toString
+      case _ =>
+        carbonTable.getPartitionInfo.getNumPartitions.toString
+    }
   }
 
   private def getLocalDictDesc(

@@ -20,6 +20,8 @@ package org.apache.carbondata.sdk.file;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.carbondata.common.annotations.InterfaceAudience;
 import org.apache.carbondata.common.annotations.InterfaceStability;
@@ -78,6 +80,26 @@ public class Field {
       this.type = DataTypes.FLOAT;
     } else if (type.equalsIgnoreCase("double")) {
       this.type = DataTypes.DOUBLE;
+    } else if (type.equalsIgnoreCase("binary")) {
+      this.type = DataTypes.BINARY;
+    } else if (type.toLowerCase().startsWith("decimal")) {
+      if ("decimal".equalsIgnoreCase(type.toLowerCase())) {
+        this.type = DataTypes.createDefaultDecimalType();
+      } else {
+        try {
+          Matcher m = Pattern.compile("^decimal\\(([^)]+)\\)").matcher(type.toLowerCase());
+          m.find();
+          String matchedString = m.group(1);
+          String[] scaleAndPrecision = matchedString.split(",");
+          precision = Integer.parseInt(scaleAndPrecision[0].trim());
+          scale = Integer.parseInt(scaleAndPrecision[1].trim());
+          this.type = DataTypes.createDecimalType(precision, scale);
+        } catch (Exception e) {
+          throw new IllegalArgumentException("unsupported data type: " + type
+              + ". Please use decimal or decimal(precision,scale), " +
+              "precision can be 10 and scale can be 2", e);
+        }
+      }
     } else if (type.equalsIgnoreCase("array")) {
       this.type = DataTypes.createDefaultArrayType();
     } else if (type.equalsIgnoreCase("struct")) {
@@ -114,6 +136,8 @@ public class Field {
       this.type = DataTypes.FLOAT;
     } else if (type.equalsIgnoreCase("double")) {
       this.type = DataTypes.DOUBLE;
+    } else if (type.equalsIgnoreCase("binary")) {
+      this.type = DataTypes.BINARY;
     } else if (type.equalsIgnoreCase("array")) {
       this.type = DataTypes.createArrayType(fields.get(0).getDataType());
     } else if (type.equalsIgnoreCase("struct")) {

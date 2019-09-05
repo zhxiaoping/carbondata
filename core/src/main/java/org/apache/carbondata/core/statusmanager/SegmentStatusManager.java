@@ -103,13 +103,18 @@ public class SegmentStatusManager {
   }
 
   public ValidAndInvalidSegmentsInfo getValidAndInvalidSegments() throws IOException {
-    return getValidAndInvalidSegments(null, null);
+    return getValidAndInvalidSegments(false, null, null);
+  }
+
+  public ValidAndInvalidSegmentsInfo getValidAndInvalidSegments(Boolean isChildTable)
+      throws IOException {
+    return getValidAndInvalidSegments(isChildTable, null, null);
   }
 
   /**
    * get valid segment for given load status details.
    */
-  public ValidAndInvalidSegmentsInfo getValidAndInvalidSegments(
+  public ValidAndInvalidSegmentsInfo getValidAndInvalidSegments(Boolean isChildTable,
       LoadMetadataDetails[] loadMetadataDetails, ReadCommittedScope readCommittedScope)
       throws IOException {
 
@@ -162,9 +167,21 @@ public class SegmentStatusManager {
                 new Segment(segment.getLoadName(), segment.getSegmentFile(), readCommittedScope));
             continue;
           }
-          listOfValidSegments.add(
-              new Segment(segment.getLoadName(), segment.getSegmentFile(), readCommittedScope,
-                  segment));
+          // In case of child table, during loading, if no record is loaded to the segment, then
+          // segmentStatus will be marked as 'Success'. During query, don't need to add that segment
+          // to validSegment list, as segment does not exists
+          if (isChildTable) {
+            if (!segment.getDataSize().equalsIgnoreCase("0") && !segment.getIndexSize()
+                .equalsIgnoreCase("0")) {
+              listOfValidSegments.add(
+                  new Segment(segment.getLoadName(), segment.getSegmentFile(), readCommittedScope,
+                      segment));
+            }
+          } else {
+            listOfValidSegments.add(
+                new Segment(segment.getLoadName(), segment.getSegmentFile(), readCommittedScope,
+                    segment));
+          }
         } else if ((SegmentStatus.LOAD_FAILURE == segment.getSegmentStatus()
             || SegmentStatus.COMPACTED == segment.getSegmentStatus()
             || SegmentStatus.MARKED_FOR_DELETE == segment.getSegmentStatus())) {
@@ -823,8 +840,7 @@ public class SegmentStatusManager {
     }
   }
 
-  private static boolean isLoadDeletionRequired(String metaDataLocation) {
-    LoadMetadataDetails[] details = SegmentStatusManager.readLoadMetadata(metaDataLocation);
+  private static boolean isLoadDeletionRequired(LoadMetadataDetails[] details) {
     if (details != null && details.length > 0) {
       for (LoadMetadataDetails oneRow : details) {
         if ((SegmentStatus.MARKED_FOR_DELETE == oneRow.getSegmentStatus()
@@ -904,34 +920,27 @@ public class SegmentStatusManager {
     }
   }
 
-  private static ReturnTuple isUpdationRequired(
-      boolean isForceDeletion,
-      CarbonTable carbonTable,
-      AbsoluteTableIdentifier absoluteTableIdentifier) {
-    LoadMetadataDetails[] details =
-        SegmentStatusManager.readLoadMetadata(carbonTable.getMetadataPath());
+  private static ReturnTuple isUpdationRequired(boolean isForceDeletion, CarbonTable carbonTable,
+      AbsoluteTableIdentifier absoluteTableIdentifier, LoadMetadataDetails[] details) {
     // Delete marked loads
-    boolean isUpdationRequired =
-        DeleteLoadFolders.deleteLoadFoldersFromFileSystem(
-            absoluteTableIdentifier,
-            isForceDeletion,
-            details,
-            carbonTable.getMetadataPath()
-        );
+    boolean isUpdationRequired = DeleteLoadFolders
+        .deleteLoadFoldersFromFileSystem(absoluteTableIdentifier, isForceDeletion, details,
+            carbonTable.getMetadataPath());
     return new ReturnTuple(details, isUpdationRequired);
   }
 
-  public static void deleteLoadsAndUpdateMetadata(
-      CarbonTable carbonTable,
-      boolean isForceDeletion,
+  public static void deleteLoadsAndUpdateMetadata(CarbonTable carbonTable, boolean isForceDeletion,
       List<PartitionSpec> partitionSpecs) throws IOException {
+    LoadMetadataDetails[] metadataDetails =
+        SegmentStatusManager.readLoadMetadata(carbonTable.getMetadataPath());
     // delete the expired segment lock files
     CarbonLockUtil.deleteExpiredSegmentLockFiles(carbonTable);
-    if (isLoadDeletionRequired(carbonTable.getMetadataPath())) {
+    if (isLoadDeletionRequired(metadataDetails)) {
       AbsoluteTableIdentifier identifier = carbonTable.getAbsoluteTableIdentifier();
       boolean updationCompletionStatus = false;
       LoadMetadataDetails[] newAddedLoadHistoryList = null;
-      ReturnTuple tuple = isUpdationRequired(isForceDeletion, carbonTable, identifier);
+      ReturnTuple tuple =
+          isUpdationRequired(isForceDeletion, carbonTable, identifier, metadataDetails);
       if (tuple.isUpdateRequired) {
         ICarbonLock carbonTableStatusLock =
             CarbonLockFactory.getCarbonLockObj(identifier, LockUsage.TABLE_STATUS_LOCK);
@@ -942,7 +951,10 @@ public class SegmentStatusManager {
           if (locked) {
             LOG.info("Table status lock has been successfully acquired.");
             // Again read status and check to verify updation required or not.
-            ReturnTuple tuple2 = isUpdationRequired(isForceDeletion, carbonTable, identifier);
+            LoadMetadataDetails[] details =
+                SegmentStatusManager.readLoadMetadata(carbonTable.getMetadataPath());
+            ReturnTuple tuple2 =
+                isUpdationRequired(isForceDeletion, carbonTable, identifier, details);
             if (!tuple2.isUpdateRequired) {
               return;
             }

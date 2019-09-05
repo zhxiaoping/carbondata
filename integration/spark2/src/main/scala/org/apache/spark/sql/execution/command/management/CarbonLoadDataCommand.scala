@@ -37,7 +37,6 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, SortOrder}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, Sort}
 import org.apache.spark.sql.execution.LogicalRDD
-import org.apache.spark.sql.execution.SQLExecution.EXECUTION_ID_KEY
 import org.apache.spark.sql.execution.command.{AtomicRunnableCommand, DataLoadTableFileMapping, UpdateTableModel}
 import org.apache.spark.sql.execution.datasources.{CatalogFileIndex, FindDataSourceTable, HadoopFsRelation, LogicalRelation, SparkCarbonTableFormat}
 import org.apache.spark.sql.hive.CarbonRelation
@@ -46,7 +45,7 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.SparkSQLUtil
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.unsafe.types.UTF8String
-import org.apache.spark.util.{CarbonReflectionUtils, CausedBy, FileUtils}
+import org.apache.spark.util.{CarbonReflectionUtils, CausedBy, FileUtils, SparkUtil}
 
 import org.apache.carbondata.common.Strings
 import org.apache.carbondata.common.logging.LogServiceFactory
@@ -612,13 +611,11 @@ case class CarbonLoadDataCommand(
       (dataFrame, dataFrame)
     }
     val table = carbonLoadModel.getCarbonDataLoadSchema.getCarbonTable
-    if (!table.isChildDataMap) {
-      GlobalDictionaryUtil.generateGlobalDictionary(
-        sparkSession.sqlContext,
-        carbonLoadModel,
-        hadoopConf,
-        dictionaryDataFrame)
-    }
+    GlobalDictionaryUtil.generateGlobalDictionary(
+      sparkSession.sqlContext,
+      carbonLoadModel,
+      hadoopConf,
+      dictionaryDataFrame)
     if (table.isHivePartitionTable) {
       rows = loadDataWithPartition(
         sparkSession,
@@ -805,6 +802,8 @@ case class CarbonLoadDataCommand(
       }
       if (updateModel.isDefined) {
         carbonLoadModel.setFactTimeStamp(updateModel.get.updatedTimeStamp)
+      } else if (carbonLoadModel.getFactTimeStamp == 0L) {
+        carbonLoadModel.setFactTimeStamp(System.currentTimeMillis())
       }
       // Create and ddd the segment to the tablestatus.
       CarbonLoaderUtil.readAndUpdateLoadProgressInTableMeta(carbonLoadModel, isOverwriteTable)
@@ -837,7 +836,7 @@ case class CarbonLoadDataCommand(
           query = logicalPlan,
           overwrite = false,
           ifPartitionNotExists = false)
-      sparkSession.sparkContext.setLocalProperty(EXECUTION_ID_KEY, null)
+      SparkUtil.setNullExecutionId(sparkSession)
       Dataset.ofRows(sparkSession, convertedPlan)
     } catch {
       case ex: Throwable =>
@@ -847,7 +846,7 @@ case class CarbonLoadDataCommand(
         }
         LOGGER.info(errorMessage)
         LOGGER.error(ex)
-        throw new Exception(errorMessage)
+        throw ex
     } finally {
       CarbonSession.threadUnset("partition.operationcontext")
       if (isOverwriteTable) {
@@ -869,7 +868,6 @@ case class CarbonLoadDataCommand(
       }
     }
     try {
-      carbonLoadModel.setFactTimeStamp(System.currentTimeMillis())
       val compactedSegments = new util.ArrayList[String]()
       // Trigger auto compaction
       CarbonDataRDDFactory.handleSegmentMerging(
@@ -887,7 +885,8 @@ case class CarbonLoadDataCommand(
           "load is passed.", e)
     }
     val specs =
-      SegmentFileStore.getPartitionSpecs(carbonLoadModel.getSegmentId, carbonLoadModel.getTablePath)
+      SegmentFileStore.getPartitionSpecs(carbonLoadModel.getSegmentId, carbonLoadModel.getTablePath,
+        SegmentStatusManager.readLoadMetadata(CarbonTablePath.getMetadataPath(table.getTablePath)))
     if (specs != null) {
       specs.asScala.map{ spec =>
         Row(spec.getPartitions.asScala.mkString("/"), spec.getLocation.toString, spec.getUuid)
@@ -945,13 +944,21 @@ case class CarbonLoadDataCommand(
       }
     }
     // Only select the required columns
-    val output = if (partition.nonEmpty) {
+    var output = if (partition.nonEmpty) {
       val lowerCasePartition = partition.map { case (key, value) => (key.toLowerCase, value) }
       catalogTable.schema.map { attr =>
         attributes.find(_.name.equalsIgnoreCase(attr.name)).get
       }.filter(attr => lowerCasePartition.getOrElse(attr.name.toLowerCase, None).isEmpty)
     } else {
       catalogTable.schema.map(f => attributes.find(_.name.equalsIgnoreCase(f.name)).get)
+    }
+    // Rearrange the partition column at the end of output list
+    if (catalogTable.partitionColumnNames.nonEmpty &&
+        (loadModel.getCarbonDataLoadSchema.getCarbonTable.isChildTable ||
+         loadModel.getCarbonDataLoadSchema.getCarbonTable.isChildDataMap) && output.nonEmpty) {
+      val partitionOutPut =
+        catalogTable.partitionColumnNames.map(col => output.find(_.name.equalsIgnoreCase(col)).get)
+      output = output.filterNot(partitionOutPut.contains(_)) ++ partitionOutPut
     }
     val partitionsLen = rdd.partitions.length
 
@@ -1040,7 +1047,7 @@ case class CarbonLoadDataCommand(
   }
 
   /**
-   * Create the logical plan for update scenario. Here we should drop the segmentid column from the
+   * Create the logical plan for update scenario. Here we should drop the segmentId column from the
    * input rdd.
    */
   private def getLogicalQueryForUpdate(
@@ -1048,7 +1055,7 @@ case class CarbonLoadDataCommand(
       catalogTable: CatalogTable,
       df: DataFrame,
       carbonLoadModel: CarbonLoadModel): LogicalPlan = {
-    sparkSession.sparkContext.setLocalProperty(EXECUTION_ID_KEY, null)
+    SparkUtil.setNullExecutionId(sparkSession)
     // In case of update, we don't need the segmrntid column in case of partitioning
     val dropAttributes = df.logicalPlan.output.dropRight(1)
     val finalOutput = catalogTable.schema.map { attr =>

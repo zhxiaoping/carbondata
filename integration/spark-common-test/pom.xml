@@ -109,6 +109,12 @@
       <groupId>org.apache.carbondata</groupId>
       <artifactId>carbondata-spark2</artifactId>
       <version>${project.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.apache.hive</groupId>
+          <artifactId>hive-exec</artifactId>
+        </exclusion>
+      </exclusions>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -163,7 +169,6 @@
   </dependencies>
 
   <build>
-    <testSourceDirectory>src/test/scala</testSourceDirectory>
     <resources>
       <resource>
         <directory>src/resources</directory>

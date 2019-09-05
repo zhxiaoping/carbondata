@@ -19,6 +19,7 @@ package org.apache.spark.sql.carbondata.execution.datasources
 import scala.collection.JavaConverters._
 
 import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.types._
 
 import org.apache.carbondata.core.constants.CarbonCommonConstants
@@ -63,6 +64,7 @@ object CarbonSparkDataSourceUtil {
         case CarbonDataTypes.FLOAT => FloatType
         case CarbonDataTypes.BOOLEAN => BooleanType
         case CarbonDataTypes.TIMESTAMP => TimestampType
+        case CarbonDataTypes.BINARY => BinaryType
         case CarbonDataTypes.DATE => DateType
         case CarbonDataTypes.VARCHAR => StringType
       }
@@ -84,6 +86,7 @@ object CarbonSparkDataSourceUtil {
       case DateType => CarbonDataTypes.DATE
       case BooleanType => CarbonDataTypes.BOOLEAN
       case TimestampType => CarbonDataTypes.TIMESTAMP
+      case BinaryType => CarbonDataTypes.BINARY
       case ArrayType(elementType, _) =>
         CarbonDataTypes.createArrayType(convertSparkToCarbonDataType(elementType))
       case StructType(fields) =>
@@ -195,7 +198,17 @@ object CarbonSparkDataSourceUtil {
       } else {
         dataTypeOfAttribute
       }
-      new CarbonLiteralExpression(value, dataType)
+      val dataValue = if (dataTypeOfAttribute.equals(CarbonDataTypes.BINARY)
+              && Option(value).isDefined) {
+        new String(value.asInstanceOf[Array[Byte]])
+      } else if (dataTypeOfAttribute.equals(CarbonDataTypes.DATE) &&
+                 value.isInstanceOf[java.sql.Date]) {
+        // In case of Date object , convert back to int.
+        DateTimeUtils.fromJavaDate(value.asInstanceOf[java.sql.Date])
+      } else {
+        value
+      }
+      new CarbonLiteralExpression(dataValue, dataType)
     }
 
     createFilter(predicate)
@@ -228,6 +241,10 @@ object CarbonSparkDataSourceUtil {
     val blockletSize = options.get("table_blockletsize").map(_.toInt)
     if (blockletSize.isDefined) {
       builder.withBlockletSize(blockletSize.get)
+    }
+    val pageSizeInMb = options.get("table_page_size_inmb").map(_.toInt)
+    if (pageSizeInMb.isDefined) {
+      builder.withPageSizeInMb(pageSizeInMb.get)
     }
     builder.enableLocalDictionary(options.getOrElse(CarbonCommonConstants.LOCAL_DICTIONARY_ENABLE,
       CarbonCommonConstants.LOCAL_DICTIONARY_ENABLE_DEFAULT).toBoolean)
@@ -262,6 +279,10 @@ object CarbonSparkDataSourceUtil {
     }
     builder.uniqueIdentifier(System.currentTimeMillis())
     val model = builder.buildLoadModel(schema)
+    val binary_decoder = options.get("binary_decoder").map(_.toString.toLowerCase())
+    if (binary_decoder.isDefined) {
+      model.setBinaryDecoder(String.valueOf(binary_decoder.get))
+    }
     val tableInfo = model.getCarbonDataLoadSchema.getCarbonTable.getTableInfo
     val properties =
       tableInfo.getFactTable.getTableProperties

@@ -22,14 +22,16 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAlias, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.{Alias, ScalaUDF}
-import org.apache.spark.sql.catalyst.plans.logical.{Command, DeserializeToObject, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Command, DeserializeToObject, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 
 import org.apache.carbondata.common.logging.LogServiceFactory
+import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.datamap.DataMapStoreManager
 import org.apache.carbondata.core.metadata.schema.datamap.DataMapClassProvider
 import org.apache.carbondata.core.metadata.schema.table.DataMapSchema
+import org.apache.carbondata.core.util.ThreadLocalSessionInfo
 import org.apache.carbondata.datamap.DataMapManager
 import org.apache.carbondata.mv.rewrite.{SummaryDataset, SummaryDatasetCatalog}
 
@@ -65,11 +67,26 @@ class MVAnalyzerRule(sparkSession: SparkSession) extends Rule[LogicalPlan] {
         needAnalysis = false
         attr
     }
+    plan.transform {
+      case aggregate@Aggregate(grp, aExp, child) =>
+        // check for if plan is for dataload for preaggregate table, then skip applying mv
+        val isPreAggLoad = aExp.exists { p =>
+          if (p.isInstanceOf[UnresolvedAlias]) {
+            false
+          } else {
+            p.name.equals("preAggLoad") || p.name.equals("preAgg")
+          }
+        }
+        if (isPreAggLoad) {
+          needAnalysis = false
+        }
+        Aggregate(grp, aExp, child)
+    }
     val catalog = DataMapStoreManager.getInstance().getDataMapCatalog(dataMapProvider,
       DataMapClassProvider.MV.getShortName).asInstanceOf[SummaryDatasetCatalog]
     if (needAnalysis && catalog != null && isValidPlan(plan, catalog)) {
       val modularPlan = catalog.mvSession.sessionState.rewritePlan(plan).withMVTable
-      if (modularPlan.find (_.rewritten).isDefined) {
+      if (modularPlan.find(_.rewritten).isDefined) {
         val compactSQL = modularPlan.asCompactSQL
         val analyzed = sparkSession.sql(compactSQL).queryExecution.analyzed
         analyzed
@@ -88,7 +105,8 @@ class MVAnalyzerRule(sparkSession: SparkSession) extends Rule[LogicalPlan] {
     if (!plan.isInstanceOf[Command]  && !plan.isInstanceOf[DeserializeToObject]) {
       val catalogs = extractCatalogs(plan)
       !isDataMapReplaced(catalog.listAllValidSchema(), catalogs) &&
-      isDataMapExists(catalog.listAllValidSchema(), catalogs)
+      isDataMapExists(catalog.listAllValidSchema(), catalogs) &&
+      !isSegmentSetForMainTable(catalogs)
     } else {
       false
     }
@@ -136,4 +154,29 @@ class MVAnalyzerRule(sparkSession: SparkSession) extends Rule[LogicalPlan] {
     }
     catalogs
   }
+
+  /**
+   * Check if any segments are set for main table for Query. If any segments are set, then
+   * skip mv datamap table for query
+   */
+  def isSegmentSetForMainTable(catalogs: Seq[Option[CatalogTable]]): Boolean = {
+    catalogs.foreach { c =>
+      val carbonSessionInfo = ThreadLocalSessionInfo.getCarbonSessionInfo
+      if (carbonSessionInfo != null) {
+        val segmentsToQuery = carbonSessionInfo.getSessionParams
+          .getProperty(CarbonCommonConstants.CARBON_INPUT_SEGMENTS +
+                       c.get.identifier.database.get + "." +
+                       c.get.identifier.table, "")
+        if (segmentsToQuery.isEmpty || segmentsToQuery.equalsIgnoreCase("*")) {
+          return false
+        } else {
+          return true
+        }
+      } else {
+        return false
+      }
+    }
+    false
+  }
+
 }

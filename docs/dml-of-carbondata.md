@@ -35,10 +35,13 @@ CarbonData DML statements are documented here,which includes:
   This command is used to load csv files to carbondata, OPTIONS are not mandatory for data loading process. 
 
   ```
-  LOAD DATA [LOCAL] INPATH 'folder_path' 
+  LOAD DATA INPATH 'folder_path'
   INTO TABLE [db_name.]table_name 
   OPTIONS(property_name=property_value, ...)
   ```
+  **NOTE**:
+    * Use 'file://' prefix to indicate local input files path, but it just supports local mode.
+    * If run on cluster mode, please upload all input files to distributed file system, for example 'hdfs://' for hdfs.
 
   **Supported Properties:**
 
@@ -67,6 +70,7 @@ CarbonData DML statements are documented here,which includes:
 | [IS_EMPTY_DATA_BAD_RECORD](#bad-records-handling)       | Whether empty data of a column to be considered as bad record or not |
 | [GLOBAL_SORT_PARTITIONS](#global_sort_partitions)       | Number of partition to use for shuffling of data during sorting |
 | [SCALE_FACTOR](#scale_factor)                           | Control the partition size for RANGE_COLUMN feature          |
+| [CARBON_OPTIONS_BINARY_DECODER]                         | Support configurable decode for loading from csv             |
 -
   You can use the following options to load data:
 
@@ -232,7 +236,7 @@ CarbonData DML statements are documented here,which includes:
    Example:
 
    ```
-   LOAD DATA local inpath '/opt/rawdata/data.csv' INTO table carbontable
+   LOAD DATA inpath '/opt/rawdata/data.csv' INTO table carbontable
    options('DELIMITER'=',', 'QUOTECHAR'='"','COMMENTCHAR'='#',
    'HEADER'='false',
    'FILEHEADER'='empno,empname,designation,doj,workgroupcategory,
@@ -278,6 +282,8 @@ CarbonData DML statements are documented here,which includes:
 
     If the SORT_SCOPE is defined as GLOBAL_SORT, then user can specify the number of partitions to use while shuffling data for sort using GLOBAL_SORT_PARTITIONS. If it is not configured, or configured less than 1, then it uses the number of map task as reduce task. It is recommended that each reduce task deal with 512MB-1GB data.
     For RANGE_COLUMN, GLOBAL_SORT_PARTITIONS is used to specify the number of range partitions also.
+    GLOBAL_SORT_PARTITIONS should be specified optimally during RANGE_COLUMN LOAD because if a higher number is configured then the load time may be less but it will result in creation of more files which would degrade the query and compaction performance.
+    Conversely, if less partitions are configured then the load performance may degrade due to less use of parallelism but the query and compaction will become faster. Hence the user may choose optimal number depending on the use case.
   ```
   OPTIONS('GLOBAL_SORT_PARTITIONS'='2')
   ```
@@ -301,6 +307,11 @@ CarbonData DML statements are documented here,which includes:
    **NOTE:**
    * If both GLOBAL_SORT_PARTITIONS and SCALE_FACTOR are used at the same time, only GLOBAL_SORT_PARTITIONS is valid.
    * The compaction on RANGE_COLUMN will use LOCAL_SORT by default.
+
+   - ##### CARBON_ENABLE_RANGE_COMPACTION
+
+   To configure Ranges-based Compaction to be used or not for RANGE_COLUMN.
+   The default value is 'true'.
 
 ### INSERT DATA INTO CARBONDATA TABLE
 
@@ -350,17 +361,19 @@ CarbonData DML statements are documented here,which includes:
   This command allows you to load data using static partition.
 
   ```
-  LOAD DATA [LOCAL] INPATH 'folder_path' 
+  LOAD DATA INPATH 'folder_path'
   INTO TABLE [db_name.]table_name PARTITION (partition_spec) 
-  OPTIONS(property_name=property_value, ...)    
-  INSERT INTO INTO TABLE [db_name.]table_name PARTITION (partition_spec) <SELECT STATEMENT>
+  OPTIONS(property_name=property_value, ...)
+
+  INSERT INTO TABLE [db_name.]table_name PARTITION (partition_spec) <SELECT STATEMENT>
   ```
 
   Example:
   ```
-  LOAD DATA LOCAL INPATH '${env:HOME}/staticinput.csv'
+  LOAD DATA INPATH '${env:HOME}/staticinput.csv'
   INTO TABLE locationTable
-  PARTITION (country = 'US', state = 'CA')  
+  PARTITION (country = 'US', state = 'CA')
+
   INSERT INTO TABLE locationTable
   PARTITION (country = 'US', state = 'AL')
   SELECT <columns list excluding partition columns> FROM another_user
@@ -372,8 +385,9 @@ CarbonData DML statements are documented here,which includes:
 
   Example:
   ```
-  LOAD DATA LOCAL INPATH '${env:HOME}/staticinput.csv'
-  INTO TABLE locationTable          
+  LOAD DATA INPATH '${env:HOME}/staticinput.csv'
+  INTO TABLE locationTable
+
   INSERT INTO TABLE locationTable
   SELECT <columns list excluding partition columns> FROM another_user
   ```

@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.JoinType
 import org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.SQLConf
 import org.apache.spark.sql.util.SparkSQLUtil
 
 import org.apache.carbondata.mv.plans.modular.Flags._
@@ -47,19 +47,27 @@ case class ModularRelation(databaseName: String,
   override def computeStats(spark: SparkSession, conf: SQLConf): Statistics = {
     val plan = spark.table(s"${ databaseName }.${ tableName }").queryExecution.optimizedPlan
     val stats = SparkSQLUtil.invokeStatsMethod(plan, conf)
-    val output = outputList.map(_.toAttribute)
-    val mapSeq = plan.collect { case n: logical.LeafNode => n }.map {
-      table => AttributeMap(table.output.zip(output))
-    }
-    val rewrites = mapSeq(0)
-    val attributeStats = AttributeMap(stats.attributeStats.iterator
-      .map { pair => (rewrites(pair._1), pair._2) }.toSeq)
-    Statistics(stats.sizeInBytes, stats.rowCount, attributeStats, stats.hints)
+    SparkSQLUtil.getStatisticsObj(outputList, plan, stats)
   }
 
   override def output: Seq[Attribute] = outputList.map(_.toAttribute)
 
   override def adjacencyList: Map[Int, Seq[(Int, JoinType)]] = Map.empty
+
+  def fineEquals(that: Any): Boolean = {
+    that match {
+      case that: ModularRelation =>
+        if ((databaseName != null && tableName != null && databaseName == that.databaseName &&
+          tableName == that.tableName && output.toString == that.output.toString) ||
+          (databaseName == null && tableName == null && that.databaseName == null &&
+            that.tableName == null && output.toString == that.output.toString)) {
+          true
+        } else {
+          false
+        }
+      case _ => false
+    }
+  }
 
   override def equals(that: Any): Boolean = {
     that match {
@@ -93,6 +101,7 @@ object HarmonizedRelation {
             case alias: Alias =>
               alias.child.isInstanceOf[AttributeReference] ||
               alias.child.isInstanceOf[Literal] ||
+              alias.child.isInstanceOf[Expression] ||
               (alias.child match {
                 case AggregateExpression(First(_, _), _, _, _) => true
                 case AggregateExpression(Last(_, _), _, _, _) => true
@@ -140,10 +149,6 @@ case class HarmonizedRelation(source: ModularPlan) extends LeafNode {
     val stats = SparkSQLUtil.invokeStatsMethod(plan, conf)
     val output = source.asInstanceOf[GroupBy].child.children(0).asInstanceOf[ModularRelation]
       .outputList.map(_.toAttribute)
-    val mapSeq = plan.collect { case n: logical.LeafNode => n }.map {
-      table => AttributeMap(table.output.zip(output))
-    }
-    val rewrites = mapSeq.head
     val aliasMap = AttributeMap(
       source.asInstanceOf[GroupBy].outputList.collect {
         case a@Alias(ar: Attribute, _) => (ar, a.toAttribute)
@@ -152,12 +157,7 @@ case class HarmonizedRelation(source: ModularPlan) extends LeafNode {
         case a@Alias(AggregateExpression(Last(ar: Attribute, _), _, _, _), _) =>
           (ar, a.toAttribute)
       })
-    val aStatsIterator = stats.attributeStats.iterator.map { pair => (rewrites(pair._1), pair._2) }
-    val attributeStats =
-      AttributeMap(
-        aStatsIterator.map(pair => (aliasMap.get(pair._1).getOrElse(pair._1), pair._2)).toSeq)
-
-    Statistics(stats.sizeInBytes, None, attributeStats, stats.hints)
+    SparkSQLUtil.getStatisticsObj(output, plan, stats, Option(aliasMap))
   }
 
   override def output: Seq[Attribute] = source.output

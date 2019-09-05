@@ -35,6 +35,7 @@ import org.apache.carbondata.core.cache.CacheType;
 import org.apache.carbondata.core.cache.dictionary.Dictionary;
 import org.apache.carbondata.core.cache.dictionary.DictionaryColumnUniqueIdentifier;
 import org.apache.carbondata.core.constants.CarbonCommonConstants;
+import org.apache.carbondata.core.constants.CarbonLoadOptionConstants;
 import org.apache.carbondata.core.datamap.Segment;
 import org.apache.carbondata.core.datastore.block.Distributable;
 import org.apache.carbondata.core.datastore.block.TableBlockInfo;
@@ -263,15 +264,26 @@ public final class CarbonLoaderUtil {
           String segmentId =
               String.valueOf(SegmentStatusManager.createNewSegmentId(listOfLoadFolderDetailsArray));
           loadModel.setLoadMetadataDetails(listOfLoadFolderDetails);
+          LoadMetadataDetails entryTobeRemoved = null;
           // Segment id would be provided in case this is compaction flow for aggregate data map.
           // If that is true then used the segment id as the load name.
           if (loadModel.getCarbonDataLoadSchema().getCarbonTable().isChildDataMap() && !loadModel
               .getSegmentId().isEmpty()) {
             newMetaEntry.setLoadName(loadModel.getSegmentId());
+          } else if (loadModel.getCarbonDataLoadSchema().getCarbonTable().isChildTable()
+              && !loadModel.getSegmentId().isEmpty()) {
+            for (LoadMetadataDetails entry : listOfLoadFolderDetails) {
+              if (entry.getLoadName().equalsIgnoreCase(loadModel.getSegmentId())) {
+                newMetaEntry.setLoadName(loadModel.getSegmentId());
+                newMetaEntry.setExtraInfo(entry.getExtraInfo());
+                entryTobeRemoved = entry;
+              }
+            }
           } else {
             newMetaEntry.setLoadName(segmentId);
             loadModel.setSegmentId(segmentId);
           }
+          listOfLoadFolderDetails.remove(entryTobeRemoved);
           // Exception should be thrown if:
           // 1. If insert overwrite is in progress and any other load or insert operation
           // is triggered
@@ -299,6 +311,7 @@ public final class CarbonLoaderUtil {
           for (LoadMetadataDetails entry : listOfLoadFolderDetails) {
             if (entry.getLoadName().equals(newMetaEntry.getLoadName())
                 && entry.getLoadStartTime() == newMetaEntry.getLoadStartTime()) {
+              newMetaEntry.setExtraInfo(entry.getExtraInfo());
               found = true;
               break;
             }
@@ -410,6 +423,14 @@ public final class CarbonLoaderUtil {
         escapeChar.equalsIgnoreCase(CARRIAGE_RETURN.getName()) ||
         escapeChar.equalsIgnoreCase(TAB.getName()) ||
         escapeChar.equalsIgnoreCase(BACKSPACE.getName());
+  }
+
+  public static boolean isValidBinaryDecoder(String binaryDecoderChar) {
+    return CarbonLoadOptionConstants.CARBON_OPTIONS_BINARY_DECODER_BASE64.equalsIgnoreCase(
+        binaryDecoderChar) ||
+        CarbonLoadOptionConstants.CARBON_OPTIONS_BINARY_DECODER_HEX.equalsIgnoreCase(
+            binaryDecoderChar) ||
+        StringUtils.isBlank(binaryDecoderChar);
   }
 
   public static String getEscapeChar(String escapeCharacter) {
@@ -1161,15 +1182,58 @@ public final class CarbonLoaderUtil {
    * @throws IOException
    */
   public static String mergeIndexFilesInPartitionedSegment(CarbonTable table, String segmentId,
-      String uuid) throws IOException {
+      String uuid, String partitionPath) throws IOException {
     String tablePath = table.getTablePath();
     return new CarbonIndexFileMergeWriter(table)
-        .mergeCarbonIndexFilesOfSegment(segmentId, uuid, tablePath);
+        .mergeCarbonIndexFilesOfSegment(segmentId, uuid, tablePath, partitionPath);
   }
 
   private static void deleteFiles(List<String> filesToBeDeleted) throws IOException {
     for (String filePath : filesToBeDeleted) {
       FileFactory.deleteFile(filePath, FileFactory.getFileType(filePath));
+    }
+  }
+
+  /**
+   * Update specified segment status for load to MarkedForDelete in case of failure
+   */
+  public static void updateTableStatusInCaseOfFailure(String loadName,
+      AbsoluteTableIdentifier absoluteTableIdentifier, String tableName, String databaseName,
+      String tablePath, String metaDataPath) throws IOException {
+    SegmentStatusManager segmentStatusManager = new SegmentStatusManager(absoluteTableIdentifier);
+    ICarbonLock carbonLock = segmentStatusManager.getTableStatusLock();
+    try {
+      if (carbonLock.lockWithRetries()) {
+        LOGGER.info("Acquired lock for table" + databaseName + "." + tableName
+            + " for table status updation");
+        LoadMetadataDetails[] loadMetadataDetails =
+            SegmentStatusManager.readLoadMetadata(metaDataPath);
+        boolean ifTableStatusUpdateRequired = false;
+        for (LoadMetadataDetails loadMetadataDetail : loadMetadataDetails) {
+          if (loadMetadataDetail.getSegmentStatus() == SegmentStatus.INSERT_IN_PROGRESS && loadName
+              .equalsIgnoreCase(loadMetadataDetail.getLoadName())) {
+            loadMetadataDetail.setSegmentStatus(SegmentStatus.MARKED_FOR_DELETE);
+            ifTableStatusUpdateRequired = true;
+          }
+        }
+        if (ifTableStatusUpdateRequired) {
+          SegmentStatusManager
+              .writeLoadDetailsIntoFile(CarbonTablePath.getTableStatusFilePath(tablePath),
+                  loadMetadataDetails);
+        }
+      } else {
+        LOGGER.error(
+            "Not able to acquire the lock for Table status updation for table " + databaseName + "."
+                + tableName);
+      }
+    } finally {
+      if (carbonLock.unlock()) {
+        LOGGER.info("Table unlocked successfully after table status updation" + databaseName + "."
+            + tableName);
+      } else {
+        LOGGER.error("Unable to unlock Table lock for table" + databaseName + "." + tableName
+            + " during table status updation");
+      }
     }
   }
 }

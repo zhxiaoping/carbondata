@@ -126,7 +126,13 @@ class RunExamples extends QueryTest with BeforeAndAfterAll {
     CarbonReaderExample.main(null)
   }
 
-  test("HiveExample") {
-    HiveExample.exampleBody(spark, TestQueryExecutor.warehouse)
+  test("DirectSQLExample") {
+    DirectSQLExample.exampleBody(spark)
   }
+
+  test("HiveExample") {
+    HiveExample.createCarbonTable(TestQueryExecutor.warehouse)
+    HiveExample.readFromHive
+  }
+
 }

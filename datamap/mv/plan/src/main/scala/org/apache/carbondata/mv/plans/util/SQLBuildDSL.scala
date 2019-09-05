@@ -17,6 +17,7 @@
 
 package org.apache.carbondata.mv.plans.util
 
+import org.apache.spark.sql.CarbonExpressions.MatchCastExpression
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeMap, AttributeReference, AttributeSet, BitwiseAnd, Cast, Expression, Grouping, GroupingID, Literal, NamedExpression, ShiftRight}
 import org.apache.spark.sql.catalyst.plans.JoinType
 import org.apache.spark.sql.types.{ByteType, IntegerType}
@@ -160,7 +161,7 @@ trait SQLBuildDSL {
         extractRewrittenOrNonRewrittenSelectGroupBySelect(s1, g, s2, alias)
 
       case g@modular.GroupBy(_, _, _, _, s2@modular.Select(_, _, _, _, _, _, _, _, _, _), _, _, _)
-        if (g.alias.isEmpty && !s2.rewritten) =>
+        if g.alias.isEmpty =>
         val fragmentList = s2.children.zipWithIndex
           .map { case (child, index) => fragmentExtract(child, s2.aliasMap.get(index)) }
         val fList = s2.joinEdges.map {
@@ -307,6 +308,32 @@ trait SQLBuildDSL {
       operator: ModularPlan,
       alias: Option[String]): Fragment = {
     operator match {
+      case g@modular.GroupBy(_, _, _, _, s@modular.Select(_, _, _, _, _, _, _, _, _, _), _, _, _) =>
+        val fragmentList = s.children.zipWithIndex
+          .map { case (child, index) => fragmentExtract(child, s.aliasMap.get(index)) }
+        val fList = s.joinEdges.map {
+          e => {
+            (e.right, (fragmentList(e.right), Some(e.joinType), s
+              .extractRightEvaluableConditions(s.children(e.left), s.children(e.right))))
+          }
+        }.toMap
+        val from = (0 to fragmentList.length - 1)
+          .map(index => fList.get(index).getOrElse((fragmentList(index), None, Nil)))
+        val excludesPredicate = from.flatMap(_._3).toSet
+        val windowExprs = s.windowSpec
+          .map { case Seq(expr) => expr.asInstanceOf[Seq[NamedExpression]] }
+          .foldLeft(Seq.empty.asInstanceOf[Seq[NamedExpression]])(_ ++ _)
+        val select = s.outputList ++ windowExprs
+
+        SPJGFragment(
+          select, // select
+          from, // from
+          s.predicateList.filter { p => !excludesPredicate(p) }, // where
+          (Nil, Nil), // group by
+          Nil, // having
+          alias,
+          (s.flags, s.flagSpec))
+
       case s@modular.Select(_, _, _, _, _, _, _, _, _, _) =>
         val fragmentList = s.children.zipWithIndex
           .map { case (child, index) => fragmentExtract(child, s.aliasMap.get(index)) }
@@ -398,10 +425,10 @@ trait SQLBuildDSL {
               // it back.
               case ar: AttributeReference if ar == gid => GroupingID(Nil)
               case ar: AttributeReference if groupByAttrMap.contains(ar) => groupByAttrMap(ar)
-              case a@Cast(
+              case a@MatchCastExpression(
               BitwiseAnd(
               ShiftRight(ar: AttributeReference, Literal(value: Any, IntegerType)),
-              Literal(1, IntegerType)), ByteType, None) if ar == gid =>
+              Literal(1, IntegerType)), ByteType) if ar == gid =>
                 // for converting an expression to its original SQL format grouping(col)
                 val idx = groupByExprs.length - 1 - value.asInstanceOf[Int]
                 groupByExprs.lift(idx).map(Grouping).getOrElse(a)

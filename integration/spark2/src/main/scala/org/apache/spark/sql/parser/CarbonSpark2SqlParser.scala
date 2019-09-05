@@ -33,11 +33,11 @@ import org.apache.spark.sql.execution.command.table.CarbonCreateTableCommand
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.sql.CarbonExpressions.CarbonUnresolvedRelation
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+import org.apache.spark.sql.execution.command.cache.{CarbonDropCacheCommand, CarbonShowCacheCommand}
 import org.apache.spark.sql.execution.command.stream.{CarbonCreateStreamCommand, CarbonDropStreamCommand, CarbonShowStreamsCommand}
 import org.apache.spark.sql.util.CarbonException
 import org.apache.spark.util.CarbonReflectionUtils
 
-import org.apache.carbondata.api.CarbonStore.LOGGER
 import org.apache.carbondata.common.exceptions.sql.MalformedCarbonCommandException
 import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.spark.CarbonOption
@@ -77,7 +77,8 @@ class CarbonSpark2SqlParser extends CarbonDDLSqlParser {
 
   protected lazy val startCommand: Parser[LogicalPlan] =
     loadManagement | showLoads | alterTable | restructure | updateTable | deleteRecords |
-    alterPartition | datamapManagement | alterTableFinishStreaming | stream | cli
+    alterPartition | datamapManagement | alterTableFinishStreaming | stream | cli |
+    cacheManagement | alterDataMap
 
   protected lazy val loadManagement: Parser[LogicalPlan] =
     deleteLoadsByID | deleteLoadsByLoadDate | cleanFiles | loadDataNew
@@ -93,6 +94,9 @@ class CarbonSpark2SqlParser extends CarbonDDLSqlParser {
 
   protected lazy val stream: Parser[LogicalPlan] =
     createStream | dropStream | showStreams
+
+  protected lazy val cacheManagement: Parser[LogicalPlan] =
+    showCache | dropCache
 
   protected lazy val alterAddPartition: Parser[LogicalPlan] =
     ALTER ~> TABLE ~> (ident <~ ".").? ~ ident ~ (ADD ~> PARTITION ~>
@@ -243,6 +247,17 @@ class CarbonSpark2SqlParser extends CarbonDDLSqlParser {
         CarbonDataMapRebuildCommand(datamap, tableIdent)
     }
 
+  protected lazy val alterDataMap: Parser[LogicalPlan] =
+    ALTER ~> DATAMAP ~> (ident <~ ".").? ~ ident ~ (COMPACT ~ stringLit) ~
+    (WHERE ~> (SEGMENT ~ "." ~ ID) ~> IN ~> "(" ~> repsep(segmentId, ",") <~ ")").? <~
+    opt(";") ^^ {
+      case dbName ~ datamap ~ (compact ~ compactType) ~ segs =>
+        val altertablemodel =
+          AlterTableModel(convertDbNameToLowerCase(dbName), datamap + "_table", None, compactType,
+            Some(System.currentTimeMillis()), null, segs)
+        CarbonAlterTableCompactionCommand(altertablemodel)
+    }
+
   protected lazy val deleteRecords: Parser[LogicalPlan] =
     (DELETE ~> FROM ~> aliasTable) ~ restInput.? <~ opt(";") ^^ {
       case table ~ rest =>
@@ -269,8 +284,9 @@ class CarbonSpark2SqlParser extends CarbonDDLSqlParser {
     ("=" ~> restInput) <~ opt(";") ^^ {
       case tab ~ columns ~ rest =>
         val (sel, where) = splitQuery(rest)
+        val selectPattern = """^\s*select\s+""".r
         val (selectStmt, relation) =
-          if (!sel.toLowerCase.startsWith("select ")) {
+          if (!selectPattern.findFirstIn(sel.toLowerCase).isDefined) {
             if (sel.trim.isEmpty) {
               sys.error("At least one source column has to be specified ")
             }
@@ -494,16 +510,22 @@ class CarbonSpark2SqlParser extends CarbonDDLSqlParser {
           showHistory.isDefined)
     }
 
+  protected lazy val showCache: Parser[LogicalPlan] =
+    SHOW ~> METACACHE ~> opt(ontable) <~ opt(";") ^^ {
+      case table =>
+        CarbonShowCacheCommand(table)
+    }
+
+  protected lazy val dropCache: Parser[LogicalPlan] =
+    DROP ~> METACACHE ~> ontable <~ opt(";") ^^ {
+      case table =>
+        CarbonDropCacheCommand(table)
+    }
 
   protected lazy val cli: Parser[LogicalPlan] =
-    (CARBONCLI ~> FOR ~> TABLE) ~> (ident <~ ".").? ~ ident ~
-    (OPTIONS ~> "(" ~> commandOptions <~ ")").? <~
-    opt(";") ^^ {
-      case databaseName ~ tableName ~ commandList =>
-        var commandOptions: String = null
-        if (commandList.isDefined) {
-          commandOptions = commandList.get
-        }
+    CARBONCLI ~> FOR ~> TABLE ~> (ident <~ ".").? ~ ident ~
+    (OPTIONS ~> "(" ~> commandOptions <~ ")") <~ opt(";") ^^ {
+      case databaseName ~ tableName ~ commandOptions =>
         CarbonCliCommand(
           convertDbNameToLowerCase(databaseName),
           tableName.toLowerCase(),
@@ -665,7 +687,7 @@ class CarbonSpark2SqlParser extends CarbonDDLSqlParser {
   }
 
   def addPreAggFunction(sql: String): String = {
-    addPreAgg(new lexical.Scanner(sql.toLowerCase)) match {
+    addPreAgg(new lexical.Scanner(sql)) match {
       case Success(query, _) => query
       case _ =>
         throw new MalformedCarbonCommandException(s"Unsupported query")
@@ -673,7 +695,7 @@ class CarbonSpark2SqlParser extends CarbonDDLSqlParser {
   }
 
   def addPreAggLoadFunction(sql: String): String = {
-    addPreAggLoad(new lexical.Scanner(sql.toLowerCase)) match {
+    addPreAggLoad(new lexical.Scanner(sql)) match {
       case Success(query, _) => query
       case _ =>
         throw new MalformedCarbonCommandException(s"Unsupported query")

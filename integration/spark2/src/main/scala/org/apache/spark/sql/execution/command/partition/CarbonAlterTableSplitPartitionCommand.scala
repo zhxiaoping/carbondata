@@ -69,7 +69,6 @@ case class CarbonAlterTableSplitPartitionCommand(
     if (relation == null) {
       throwMetadataException(dbName, tableName, "table not found")
     }
-    carbonMetaStore.checkSchemasModifiedTimeAndReloadTable(TableIdentifier(tableName, Some(dbName)))
     if (null == (CarbonEnv.getCarbonTable(Some(dbName), tableName)(sparkSession))) {
       LOGGER.error(s"Alter table failed. table not found: $dbName.$tableName")
       throwMetadataException(dbName, tableName, "table not found")
@@ -107,8 +106,6 @@ case class CarbonAlterTableSplitPartitionCommand(
       thriftTable,
       null,
       carbonTable.getAbsoluteTableIdentifier.getTablePath)(sparkSession)
-    // update the schema modified time
-    carbonMetaStore.updateAndTouchSchemasUpdatedTime()
     Seq.empty
   }
 
@@ -221,7 +218,8 @@ case class CarbonAlterTableSplitPartitionCommand(
       val carbonTable = carbonLoadModel.getCarbonDataLoadSchema.getCarbonTable
       val absoluteTableIdentifier = carbonTable.getAbsoluteTableIdentifier
       val segmentStatusManager = new SegmentStatusManager(absoluteTableIdentifier)
-      val validSegments = segmentStatusManager.getValidAndInvalidSegments.getValidSegments.asScala
+      val validSegments = segmentStatusManager.getValidAndInvalidSegments(carbonTable.isChildTable)
+        .getValidSegments.asScala
       val threadArray: Array[SplitThread] = new Array[SplitThread](validSegments.size)
       var i = 0
       validSegments.foreach { segmentId =>

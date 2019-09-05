@@ -31,6 +31,7 @@ import org.apache.carbondata.common.constants.LoggerAction;
 import org.apache.carbondata.common.exceptions.sql.InvalidLoadOptionException;
 import org.apache.carbondata.common.logging.LogServiceFactory;
 import org.apache.carbondata.core.constants.CarbonCommonConstants;
+import org.apache.carbondata.core.constants.CarbonLoadOptionConstants;
 import org.apache.carbondata.core.constants.SortScopeOptions;
 import org.apache.carbondata.core.datastore.compression.CompressorFactory;
 import org.apache.carbondata.core.metadata.schema.table.CarbonTable;
@@ -39,7 +40,9 @@ import org.apache.carbondata.core.util.CarbonProperties;
 import org.apache.carbondata.core.util.CarbonUtil;
 import org.apache.carbondata.processing.loading.constants.DataLoadProcessorConstants;
 import org.apache.carbondata.processing.loading.csvinput.CSVInputFormat;
+import org.apache.carbondata.processing.loading.exception.CarbonDataLoadingException;
 import org.apache.carbondata.processing.util.CarbonBadRecordUtil;
+import org.apache.carbondata.processing.util.CarbonLoaderUtil;
 import org.apache.carbondata.processing.util.TableOptionConstant;
 
 import org.apache.commons.lang.StringUtils;
@@ -109,6 +112,7 @@ public class CarbonLoadModelBuilder {
       throw new InvalidLoadOptionException(e.getMessage());
     }
     validateAndSetColumnCompressor(model);
+    validateAndSetBinaryDecoder(model);
     return model;
   }
 
@@ -224,6 +228,8 @@ public class CarbonLoadModelBuilder {
       }
     }
 
+    String binaryDecoder = options.get("binary_decoder");
+    carbonLoadModel.setBinaryDecoder(binaryDecoder);
     carbonLoadModel.setTimestampformat(timestampformat);
     carbonLoadModel.setDateFormat(dateFormat);
     carbonLoadModel.setDefaultTimestampFormat(
@@ -300,6 +306,7 @@ public class CarbonLoadModelBuilder {
     validateAndSetLoadMinSize(carbonLoadModel);
 
     validateAndSetColumnCompressor(carbonLoadModel);
+    validateAndSetBinaryDecoder(carbonLoadModel);
 
     validateRangeColumn(optionsFinal, carbonLoadModel);
   }
@@ -424,6 +431,22 @@ public class CarbonLoadModelBuilder {
       LOGGER.error(e.getMessage(), e);
       throw new InvalidLoadOptionException("Failed to load the compressor");
     }
+  }
+
+
+  private void validateAndSetBinaryDecoder(CarbonLoadModel carbonLoadModel) {
+    String binaryDecoder = carbonLoadModel.getBinaryDecoder();
+    if (!CarbonLoaderUtil.isValidBinaryDecoder(binaryDecoder)) {
+      throw new CarbonDataLoadingException("Binary decoder only support Base64, " +
+          "Hex or no decode for string, don't support " + binaryDecoder);
+    }
+    if (StringUtils.isBlank(binaryDecoder)) {
+      binaryDecoder = CarbonProperties.getInstance().getProperty(
+          CarbonLoadOptionConstants.CARBON_OPTIONS_BINARY_DECODER,
+          CarbonLoadOptionConstants.CARBON_OPTIONS_BINARY_DECODER_DEFAULT);
+    }
+    // check and load binary decoder
+    carbonLoadModel.setBinaryDecoder(binaryDecoder);
   }
 
   /**

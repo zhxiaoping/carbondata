@@ -88,8 +88,6 @@ import org.apache.carbondata.core.statusmanager.LoadMetadataDetails;
 import org.apache.carbondata.core.statusmanager.SegmentStatus;
 import org.apache.carbondata.core.statusmanager.SegmentStatusManager;
 import org.apache.carbondata.core.statusmanager.SegmentUpdateStatusManager;
-import org.apache.carbondata.core.util.comparator.Comparator;
-import org.apache.carbondata.core.util.comparator.SerializableComparator;
 import org.apache.carbondata.core.util.path.CarbonTablePath;
 import org.apache.carbondata.format.BlockletHeader;
 import org.apache.carbondata.format.DataChunk2;
@@ -100,6 +98,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.input.ClassLoaderObjectInputStream;
 import org.apache.commons.lang.ArrayUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang3.StringEscapeUtils;
@@ -632,7 +631,7 @@ public final class CarbonUtil {
     String defaultFsUrl = FileFactory.getConfiguration().get(CarbonCommonConstants.FS_DEFAULT_FS);
     String baseDFSUrl = CarbonProperties.getInstance()
         .getProperty(CarbonCommonConstants.CARBON_DDL_BASE_HDFS_URL, "");
-    if (checkIfPrefixExists(filePath)) {
+    if (FileFactory.checkIfPrefixExists(filePath)) {
       return currentPath;
     }
     if (baseDFSUrl.endsWith("/")) {
@@ -642,7 +641,7 @@ public final class CarbonUtil {
       filePath = "/" + filePath;
     }
     currentPath = baseDFSUrl + filePath;
-    if (checkIfPrefixExists(currentPath)) {
+    if (FileFactory.checkIfPrefixExists(currentPath)) {
       return currentPath;
     }
     if (defaultFsUrl == null) {
@@ -659,7 +658,7 @@ public final class CarbonUtil {
   public static String checkAndAppendFileSystemURIScheme(String filePath) {
     String currentPath = filePath;
 
-    if (checkIfPrefixExists(filePath)) {
+    if (FileFactory.checkIfPrefixExists(filePath)) {
       return currentPath;
     }
     if (!filePath.startsWith("/")) {
@@ -687,18 +686,6 @@ public final class CarbonUtil {
       return "";
     }
   }
-
-  private static boolean checkIfPrefixExists(String path) {
-    final String lowerPath = path.toLowerCase(Locale.getDefault());
-    return lowerPath.startsWith(CarbonCommonConstants.HDFSURL_PREFIX) ||
-        lowerPath.startsWith(CarbonCommonConstants.VIEWFSURL_PREFIX) ||
-        lowerPath.startsWith(CarbonCommonConstants.LOCAL_FILE_PREFIX) ||
-        lowerPath.startsWith(CarbonCommonConstants.ALLUXIOURL_PREFIX) ||
-        lowerPath.startsWith(CarbonCommonConstants.S3N_PREFIX) ||
-        lowerPath.startsWith(CarbonCommonConstants.S3_PREFIX) ||
-        lowerPath.startsWith(CarbonCommonConstants.S3A_PREFIX);
-  }
-
   public static String removeAKSK(String filePath) {
     if (null == filePath) {
       return "";
@@ -1536,7 +1523,8 @@ public final class CarbonUtil {
     ValueEncoderMeta meta = null;
     try {
       aos = new ByteArrayInputStream(encoderMeta);
-      objStream = new ObjectInputStream(aos);
+      objStream =
+          new ClassLoaderObjectInputStream(Thread.currentThread().getContextClassLoader(), aos);
       meta = (ValueEncoderMeta) objStream.readObject();
     } catch (ClassNotFoundException e) {
       LOGGER.error(e.getMessage(), e);
@@ -2177,7 +2165,11 @@ public final class CarbonUtil {
         return DataTypes.FLOAT;
       case BYTE:
         return DataTypes.BYTE;
+      case BINARY:
+        return DataTypes.BINARY;
       default:
+        LOGGER.warn(String.format("Cannot match the data type, using default String data type: %s",
+            DataTypes.STRING.getName()));
         return DataTypes.STRING;
     }
   }
@@ -2247,7 +2239,6 @@ public final class CarbonUtil {
     org.apache.carbondata.format.TableInfo tableInfo =
         new org.apache.carbondata.format.TableInfo(thriftFactTable,
             new ArrayList<org.apache.carbondata.format.TableSchema>());
-
     tableInfo.setDataMapSchemas(null);
     return tableInfo;
   }
@@ -2382,9 +2373,8 @@ public final class CarbonUtil {
       return b.array();
     } else if (DataTypes.isDecimal(dataType)) {
       return DataTypeUtil.bigDecimalToByte((BigDecimal) value);
-    } else if (dataType == DataTypes.BYTE_ARRAY) {
-      return (byte[]) value;
-    } else if (dataType == DataTypes.STRING
+    } else if (dataType == DataTypes.BYTE_ARRAY || dataType == DataTypes.BINARY
+        || dataType == DataTypes.STRING
         || dataType == DataTypes.DATE
         || dataType == DataTypes.VARCHAR) {
       return (byte[]) value;
@@ -2563,6 +2553,7 @@ public final class CarbonUtil {
       case ALLUXIO:
       case VIEWFS:
       case S3:
+      case CUSTOM:
         Path path = new Path(segmentPath);
         FileSystem fs = path.getFileSystem(FileFactory.getConfiguration());
         if (fs.exists(path)) {
@@ -2747,14 +2738,30 @@ public final class CarbonUtil {
     LOGGER.info(String.format("Copying %s to %s, operation id %d", localFilePath,
         carbonDataDirectoryPath, copyStartTime));
     try {
-      CarbonFile localCarbonFile =
-          FileFactory.getCarbonFile(localFilePath, FileFactory.getFileType(localFilePath));
+      CarbonFile localCarbonFile = FileFactory.getCarbonFile(localFilePath);
+      // the size of local carbon file must be greater than 0
+      if (localCarbonFile.getSize() == 0L) {
+        LOGGER.error("The size of local carbon file: " + localFilePath + " is 0.");
+        throw new CarbonDataWriterException("The size of local carbon file is 0.");
+      }
       String carbonFilePath = carbonDataDirectoryPath + localFilePath
           .substring(localFilePath.lastIndexOf(File.separator));
       copyLocalFileToCarbonStore(carbonFilePath, localFilePath,
           CarbonCommonConstants.BYTEBUFFER_SIZE,
           getMaxOfBlockAndFileSize(fileSizeInBytes, localCarbonFile.getSize()));
-    } catch (IOException e) {
+      CarbonFile targetCarbonFile = FileFactory.getCarbonFile(carbonFilePath);
+      // the size of carbon file must be greater than 0
+      // and the same as the size of local carbon file
+      if (targetCarbonFile.getSize() == 0L ||
+          (targetCarbonFile.getSize() != localCarbonFile.getSize())) {
+        LOGGER.error("The size of carbon file: " + carbonFilePath + " is 0 "
+            + "or is not the same as the size of local carbon file: ("
+            + "carbon file size=" + targetCarbonFile.getSize()
+            + ", local carbon file size=" + localCarbonFile.getSize() + ")");
+        throw new CarbonDataWriterException("The size of carbon file is 0 "
+            + "or is not the same as the size of local carbon file.");
+      }
+    } catch (Exception e) {
       throw new CarbonDataWriterException(
           "Problem while copying file from local store to carbon store", e);
     }
@@ -2821,51 +2828,6 @@ public final class CarbonUtil {
               + " as the block size on HDFS");
     }
     return maxSize;
-  }
-
-  /**
-   * This method will be used to update the min and max values and this will be used in case of
-   * old store where min and max values for measures are written opposite
-   * (i.e max values in place of min and min in place of max values)
-   *
-   * @param dataFileFooter
-   * @param maxValues
-   * @param minValues
-   * @param isMinValueComparison
-   * @return
-   */
-  public static byte[][] updateMinMaxValues(DataFileFooter dataFileFooter, byte[][] maxValues,
-      byte[][] minValues, boolean isMinValueComparison) {
-    byte[][] updatedMinMaxValues = new byte[maxValues.length][];
-    if (isMinValueComparison) {
-      System.arraycopy(minValues, 0, updatedMinMaxValues, 0, minValues.length);
-    } else {
-      System.arraycopy(maxValues, 0, updatedMinMaxValues, 0, maxValues.length);
-    }
-    for (int i = 0; i < maxValues.length; i++) {
-      // update min and max values only for measures
-      if (!dataFileFooter.getColumnInTable().get(i).isDimensionColumn()) {
-        DataType dataType = dataFileFooter.getColumnInTable().get(i).getDataType();
-        SerializableComparator comparator = Comparator.getComparator(dataType);
-        int compare;
-        if (isMinValueComparison) {
-          compare = comparator
-              .compare(DataTypeUtil.getMeasureObjectFromDataType(maxValues[i], dataType),
-                  DataTypeUtil.getMeasureObjectFromDataType(minValues[i], dataType));
-          if (compare < 0) {
-            updatedMinMaxValues[i] = maxValues[i];
-          }
-        } else {
-          compare = comparator
-              .compare(DataTypeUtil.getMeasureObjectFromDataType(minValues[i], dataType),
-                  DataTypeUtil.getMeasureObjectFromDataType(maxValues[i], dataType));
-          if (compare > 0) {
-            updatedMinMaxValues[i] = minValues[i];
-          }
-        }
-      }
-    }
-    return updatedMinMaxValues;
   }
 
   /**
@@ -3196,7 +3158,7 @@ public final class CarbonUtil {
       SegmentStatusManager segmentStatusManager =
           new SegmentStatusManager(carbonTable.getAbsoluteTableIdentifier());
       SegmentStatusManager.ValidAndInvalidSegmentsInfo validAndInvalidSegmentsInfo =
-          segmentStatusManager.getValidAndInvalidSegments();
+          segmentStatusManager.getValidAndInvalidSegments(carbonTable.isChildTable());
       List<Segment> validSegments = validAndInvalidSegmentsInfo.getValidSegments();
       if (validSegments.isEmpty()) {
         return carbonProperties.getFormatVersion();
@@ -3363,5 +3325,32 @@ public final class CarbonUtil {
       return tableName.substring(i + 1, tableName.length());
     }
     return null;
+  }
+
+  public static String getIndexServerTempPath(String tablePath, String queryId) {
+    String tempFolderPath = CarbonProperties.getInstance()
+        .getProperty(CarbonCommonConstants.CARBON_INDEX_SERVER_TEMP_PATH);
+    if (null == tempFolderPath) {
+      tempFolderPath =
+          tablePath + "/" + CarbonCommonConstants.INDEX_SERVER_TEMP_FOLDER_NAME + "/" + queryId;
+    } else {
+      tempFolderPath =
+          tempFolderPath + "/" + CarbonCommonConstants.INDEX_SERVER_TEMP_FOLDER_NAME + "/"
+              + queryId;
+    }
+    return tempFolderPath;
+  }
+
+  public static CarbonFile createTempFolderForIndexServer(String tablePath, String queryId)
+      throws IOException {
+    final String path = getIndexServerTempPath(tablePath, queryId);
+    CarbonFile file = FileFactory.getCarbonFile(path);
+    if (!file.mkdirs(path)) {
+      LOGGER.info("Unable to create table directory for index server");
+      return null;
+    } else {
+      LOGGER.info("Created index server temp directory" + path);
+      return file;
+    }
   }
 }

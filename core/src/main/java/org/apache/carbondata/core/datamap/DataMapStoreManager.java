@@ -31,6 +31,7 @@ import org.apache.carbondata.common.exceptions.sql.NoSuchDataMapException;
 import org.apache.carbondata.common.logging.LogServiceFactory;
 import org.apache.carbondata.core.constants.CarbonCommonConstants;
 import org.apache.carbondata.core.datamap.dev.DataMapFactory;
+import org.apache.carbondata.core.datastore.block.SegmentPropertiesAndSchemaHolder;
 import org.apache.carbondata.core.indexstore.BlockletDetailsFetcher;
 import org.apache.carbondata.core.indexstore.SegmentPropertiesFetcher;
 import org.apache.carbondata.core.indexstore.blockletindex.BlockletDataMapFactory;
@@ -53,6 +54,7 @@ import static org.apache.carbondata.core.metadata.schema.datamap.DataMapClassPro
 import static org.apache.carbondata.core.metadata.schema.datamap.DataMapClassProvider.PREAGGREGATE;
 
 import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang.StringUtils;
 import org.apache.hadoop.fs.Path;
 import org.apache.log4j.Logger;
 
@@ -238,7 +240,7 @@ public final class DataMapStoreManager {
     if (dataMapCatalog == null) {
       dataMapCatalog = dataMapProvider.createDataMapCatalog();
       if (dataMapCatalog != null) {
-        dataMapCatalogs.put(name, dataMapCatalog);
+        dataMapCatalogs.put(name.toLowerCase(), dataMapCatalog);
         dataMapCatalog.registerSchema(dataMapSchema);
       }
     } else {
@@ -281,19 +283,22 @@ public final class DataMapStoreManager {
       dataMapCatalogs = new ConcurrentHashMap<>();
       List<DataMapSchema> dataMapSchemas = getAllDataMapSchemas();
       for (DataMapSchema schema : dataMapSchemas) {
-        DataMapCatalog dataMapCatalog = dataMapCatalogs.get(schema.getProviderName());
-        if (dataMapCatalog == null) {
-          dataMapCatalog = dataMapProvider.createDataMapCatalog();
-          if (null == dataMapCatalog) {
-            throw new RuntimeException("Internal Error.");
+        if (schema.getProviderName()
+            .equalsIgnoreCase(dataMapProvider.getDataMapSchema().getProviderName())) {
+          DataMapCatalog dataMapCatalog = dataMapCatalogs.get(schema.getProviderName());
+          if (dataMapCatalog == null) {
+            dataMapCatalog = dataMapProvider.createDataMapCatalog();
+            if (null == dataMapCatalog) {
+              throw new RuntimeException("Internal Error.");
+            }
+            dataMapCatalogs.put(schema.getProviderName().toLowerCase(), dataMapCatalog);
           }
-          dataMapCatalogs.put(schema.getProviderName(), dataMapCatalog);
-        }
-        try {
-          dataMapCatalog.registerSchema(schema);
-        } catch (Exception e) {
-          // Ignore the schema
-          LOGGER.error("Error while registering schema", e);
+          try {
+            dataMapCatalog.registerSchema(schema);
+          } catch (Exception e) {
+            // Ignore the schema
+            LOGGER.error("Error while registering schema", e);
+          }
         }
       }
     }
@@ -454,10 +459,11 @@ public final class DataMapStoreManager {
 
   /**
    * Clear the invalid segments from all the datamaps of the table
-   * @param carbonTable
-   * @param segments
+   *
+   * @param carbonTable table for which the operation has to be performed.
+   * @param segments segments which have to be cleared from cache.
    */
-  public void clearInvalidSegments(CarbonTable carbonTable, List<Segment> segments)
+  public void clearInvalidSegments(CarbonTable carbonTable, List<String> segments)
       throws IOException {
     getDefaultDataMap(carbonTable).clear(segments);
     List<TableDataMap> allDataMap = getAllDataMap(carbonTable);
@@ -467,28 +473,75 @@ public final class DataMapStoreManager {
 
   }
 
+  public List<String> getSegmentsToBeRefreshed(CarbonTable carbonTable,
+      SegmentUpdateStatusManager updateStatusManager, List<Segment> filteredSegmentToAccess)
+      throws IOException {
+    List<String> toBeCleanedSegments = new ArrayList<>();
+    for (Segment filteredSegment : filteredSegmentToAccess) {
+      boolean refreshNeeded = getTableSegmentRefresher(carbonTable).isRefreshNeeded(filteredSegment,
+          updateStatusManager.getInvalidTimestampRange(filteredSegment.getSegmentNo()));
+      if (refreshNeeded) {
+        toBeCleanedSegments.add(filteredSegment.getSegmentNo());
+      }
+    }
+    return toBeCleanedSegments;
+  }
+
+  public void refreshSegmentCacheIfRequired(CarbonTable carbonTable,
+      SegmentUpdateStatusManager updateStatusManager, List<Segment> filteredSegmentToAccess)
+      throws IOException {
+    List<String> toBeCleanedSegments =
+        getSegmentsToBeRefreshed(carbonTable, updateStatusManager, filteredSegmentToAccess);
+    if (toBeCleanedSegments.size() > 0) {
+      clearInvalidSegments(carbonTable, toBeCleanedSegments);
+    }
+  }
+
   /**
    * Clear the datamap/datamaps of a table from memory
    *
    * @param identifier Table identifier
    */
   public void clearDataMaps(AbsoluteTableIdentifier identifier) {
-    CarbonTable carbonTable = getCarbonTable(identifier);
+    clearDataMaps(identifier, true);
+  }
+
+  /**
+   * Clear the datamap/datamaps of a table from memory
+   *
+   * @param identifier Table identifier
+   */
+  public void clearDataMaps(AbsoluteTableIdentifier identifier, boolean launchJob) {
     String tableUniqueName = identifier.getCarbonTableIdentifier().getTableUniqueName();
+    if (launchJob) {
+      // carbon table need to lookup only if launch job is set.
+      CarbonTable carbonTable = getCarbonTable(identifier);
+      if (null != carbonTable) {
+        String jobClassName;
+        if (CarbonProperties.getInstance()
+            .isDistributedPruningEnabled(identifier.getDatabaseName(), identifier.getTableName())) {
+          jobClassName = DataMapUtil.DISTRIBUTED_JOB_NAME;
+        } else {
+          jobClassName = DataMapUtil.EMBEDDED_JOB_NAME;
+        }
+        try {
+          DataMapUtil.executeClearDataMapJob(carbonTable, jobClassName);
+        } catch (IOException e) {
+          LOGGER.error("clear dataMap job failed", e);
+          // ignoring the exception
+        }
+      }
+    } else {
+      // remove carbon table from meta cache if launchJob is false as this would be called in
+      // executor side.
+      CarbonMetadata.getInstance()
+          .removeTable(identifier.getDatabaseName(), identifier.getTableName());
+    }
     List<TableDataMap> tableIndices = allDataMaps.get(tableUniqueName);
     if (tableIndices == null) {
       String keyUsingTablePath = getKeyUsingTablePath(identifier.getTablePath());
       if (keyUsingTablePath != null) {
         tableUniqueName = keyUsingTablePath;
-        tableIndices = allDataMaps.get(tableUniqueName);
-      }
-    }
-    if (null != carbonTable && tableIndices != null) {
-      try {
-        DataMapUtil.executeDataMapJobForClearingDataMaps(carbonTable);
-      } catch (IOException e) {
-        LOGGER.error("clear dataMap job failed", e);
-        // ignoring the exception
       }
     }
     segmentRefreshMap.remove(identifier.uniqueName());
@@ -543,29 +596,46 @@ public final class DataMapStoreManager {
    *
    * @param identifier Table identifier
    */
-  public void clearDataMap(AbsoluteTableIdentifier identifier, String dataMapName) {
+  public void deleteDataMap(AbsoluteTableIdentifier identifier, String dataMapName) {
     CarbonTable carbonTable = getCarbonTable(identifier);
+    if (carbonTable == null) {
+      // If carbon table is null then it means table is already deleted, therefore return without
+      // doing any further changes.
+      return;
+    }
     String tableUniqueName = identifier.getCarbonTableIdentifier().getTableUniqueName();
-    List<TableDataMap> tableIndices = allDataMaps.get(tableUniqueName);
-    if (tableIndices != null) {
-      int i = 0;
-      for (TableDataMap tableDataMap : tableIndices) {
-        if (carbonTable != null && tableDataMap != null && dataMapName
-            .equalsIgnoreCase(tableDataMap.getDataMapSchema().getDataMapName())) {
-          try {
-            DataMapUtil.executeDataMapJobForClearingDataMaps(carbonTable);
-            tableDataMap.clear();
-          } catch (IOException e) {
-            LOGGER.error("clear dataMap job failed", e);
-            // ignoring the exception
-          }
-          tableDataMap.deleteDatamapData();
-          tableIndices.remove(i);
-          break;
-        }
-        i++;
+    if (CarbonProperties.getInstance()
+        .isDistributedPruningEnabled(identifier.getDatabaseName(), identifier.getTableName())) {
+      try {
+        DataMapUtil
+            .executeClearDataMapJob(carbonTable, DataMapUtil.DISTRIBUTED_JOB_NAME, dataMapName);
+      } catch (IOException e) {
+        LOGGER.error("clear dataMap job failed", e);
+        // ignoring the exception
       }
-      allDataMaps.put(tableUniqueName, tableIndices);
+    } else {
+      List<TableDataMap> tableIndices = allDataMaps.get(tableUniqueName);
+      if (tableIndices != null) {
+        int i = 0;
+        for (TableDataMap tableDataMap : tableIndices) {
+          if (tableDataMap != null && dataMapName
+              .equalsIgnoreCase(tableDataMap.getDataMapSchema().getDataMapName())) {
+            try {
+              DataMapUtil
+                  .executeClearDataMapJob(carbonTable, DataMapUtil.EMBEDDED_JOB_NAME, dataMapName);
+              tableDataMap.clear();
+            } catch (IOException e) {
+              LOGGER.error("clear dataMap job failed", e);
+              // ignoring the exception
+            }
+            tableDataMap.deleteDatamapData();
+            tableIndices.remove(i);
+            break;
+          }
+          i++;
+        }
+        allDataMaps.put(tableUniqueName, tableIndices);
+      }
     }
   }
 
@@ -634,8 +704,13 @@ public final class DataMapStoreManager {
       SegmentUpdateDetails[] updateStatusDetails = statusManager.getUpdateStatusDetails();
       for (SegmentUpdateDetails updateDetails : updateStatusDetails) {
         UpdateVO updateVO = statusManager.getInvalidTimestampRange(updateDetails.getSegmentName());
-        segmentRefreshTime.put(updateVO.getSegmentId(),
-            new SegmentRefreshInfo(updateVO.getCreatedOrUpdatedTimeStamp(), 0));
+        SegmentRefreshInfo segmentRefreshInfo;
+        if (updateVO != null && updateVO.getLatestUpdateTimestamp() != null) {
+          segmentRefreshInfo = new SegmentRefreshInfo(updateVO.getCreatedOrUpdatedTimeStamp(), 0);
+        } else {
+          segmentRefreshInfo = new SegmentRefreshInfo(0L, 0);
+        }
+        segmentRefreshTime.put(updateVO.getSegmentId(), segmentRefreshInfo);
       }
     }
 
@@ -643,8 +718,11 @@ public final class DataMapStoreManager {
       SegmentRefreshInfo segmentRefreshInfo =
           seg.getSegmentRefreshInfo(updateVo);
       String segmentId = seg.getSegmentNo();
+      if (segmentRefreshInfo.getSegmentUpdatedTimestamp() == null) {
+        return false;
+      }
       if (segmentRefreshTime.get(segmentId) == null
-          && segmentRefreshInfo.getSegmentUpdatedTimestamp() != null) {
+          && segmentRefreshInfo.getSegmentUpdatedTimestamp() != 0) {
         segmentRefreshTime.put(segmentId, segmentRefreshInfo);
         return true;
       }
@@ -673,6 +751,32 @@ public final class DataMapStoreManager {
       } else {
         return false;
       }
+    }
+  }
+
+  public synchronized void clearInvalidDataMaps(CarbonTable carbonTable, List<String> segmentNos,
+      String dataMapToClear) throws IOException {
+    List<TableDataMap> dataMaps = getAllDataMap(carbonTable);
+    List<TableDataMap> remainingDataMaps = new ArrayList<>();
+    if (StringUtils.isNotEmpty(dataMapToClear)) {
+      Iterator<TableDataMap> dataMapIterator = dataMaps.iterator();
+      while (dataMapIterator.hasNext()) {
+        TableDataMap tableDataMap = dataMapIterator.next();
+        if (dataMapToClear.equalsIgnoreCase(tableDataMap.getDataMapSchema().getDataMapName())) {
+          for (String segment: segmentNos) {
+            tableDataMap.deleteSegmentDatamapData(segment);
+          }
+          tableDataMap.clear();
+        } else {
+          remainingDataMaps.add(tableDataMap);
+        }
+      }
+      getAllDataMaps().put(carbonTable.getTableUniqueName(), remainingDataMaps);
+    } else {
+      clearDataMaps(carbonTable.getTableUniqueName());
+      // clear the segment properties cache from executor
+      SegmentPropertiesAndSchemaHolder.getInstance()
+          .invalidate(carbonTable.getAbsoluteTableIdentifier());
     }
   }
 

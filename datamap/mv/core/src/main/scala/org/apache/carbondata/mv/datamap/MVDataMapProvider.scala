@@ -18,7 +18,9 @@ package org.apache.carbondata.mv.datamap
 
 import java.io.IOException
 
-import org.apache.spark.sql.SparkSession
+import scala.collection.JavaConverters._
+
+import org.apache.spark.sql.{CarbonSession, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias
 import org.apache.spark.sql.execution.command.management.CarbonLoadDataCommand
@@ -29,11 +31,15 @@ import org.apache.spark.sql.util.SparkSQLUtil
 
 import org.apache.carbondata.common.annotations.InterfaceAudience
 import org.apache.carbondata.common.exceptions.sql.MalformedDataMapCommandException
+import org.apache.carbondata.common.logging.LogServiceFactory
+import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.datamap.{DataMapCatalog, DataMapProvider, DataMapStoreManager}
 import org.apache.carbondata.core.datamap.dev.{DataMap, DataMapFactory}
+import org.apache.carbondata.core.datamap.status.DataMapStatusManager
 import org.apache.carbondata.core.indexstore.Blocklet
 import org.apache.carbondata.core.metadata.schema.table.{CarbonTable, DataMapSchema}
 import org.apache.carbondata.mv.rewrite.{SummaryDataset, SummaryDatasetCatalog}
+import org.apache.carbondata.processing.util.CarbonLoaderUtil
 
 @InterfaceAudience.Internal
 class MVDataMapProvider(
@@ -43,6 +49,8 @@ class MVDataMapProvider(
   extends DataMapProvider(mainTable, dataMapSchema) {
   protected var dropTableCommand: CarbonDropTableCommand = null
 
+  private val LOGGER = LogServiceFactory.getLogService(this.getClass.getCanonicalName)
+
   @throws[MalformedDataMapCommandException]
   @throws[IOException]
   override def initMeta(ctasSqlStatement: String): Unit = {
@@ -51,10 +59,29 @@ class MVDataMapProvider(
         "select statement is mandatory")
     }
     MVHelper.createMVDataMap(sparkSession, dataMapSchema, ctasSqlStatement, true)
-    DataMapStoreManager.getInstance.registerDataMapCatalog(this, dataMapSchema)
+    try {
+      DataMapStoreManager.getInstance.registerDataMapCatalog(this, dataMapSchema)
+      if (dataMapSchema.isLazy) {
+        DataMapStatusManager.disableDataMap(dataMapSchema.getDataMapName)
+      }
+    } catch {
+      case exception: Exception =>
+        dropTableCommand = new CarbonDropTableCommand(true,
+          new Some[String](dataMapSchema.getRelationIdentifier.getDatabaseName),
+          dataMapSchema.getRelationIdentifier.getTableName,
+          true)
+        dropTableCommand.run(sparkSession)
+        DataMapStoreManager.getInstance().dropDataMapSchema(dataMapSchema.getDataMapName)
+        throw exception
+    }
   }
 
   override def initData(): Unit = {
+    if (!dataMapSchema.isLazy) {
+      if (rebuild()) {
+        DataMapStatusManager.enableDataMap(dataMapSchema.getDataMapName)
+      }
+    }
   }
 
   @throws[IOException]
@@ -75,13 +102,15 @@ class MVDataMapProvider(
   }
 
   @throws[IOException]
-  override def rebuild(): Unit = {
+  override def rebuildInternal(newLoadName: String,
+      segmentMap: java.util.Map[String, java.util.List[String]],
+      dataMapTable: CarbonTable): Boolean = {
     val ctasQuery = dataMapSchema.getCtasQuery
     if (ctasQuery != null) {
       val identifier = dataMapSchema.getRelationIdentifier
       val logicalPlan =
         new FindDataSourceTable(sparkSession).apply(
-          sparkSession.sessionState.catalog.lookupRelation(
+          SparkSQLUtil.sessionState(sparkSession).catalog.lookupRelation(
           TableIdentifier(identifier.getTableName,
             Some(identifier.getDatabaseName)))) match {
           case s: SubqueryAlias => s.child
@@ -91,29 +120,83 @@ class MVDataMapProvider(
       val queryPlan = SparkSQLUtil.execute(
         sparkSession.sql(updatedQuery).queryExecution.analyzed,
         sparkSession).drop("preAgg")
-      val header = logicalPlan.output.map(_.name).mkString(",")
+      var isOverwriteTable = false
+      val isFullRefresh =
+        if (null != dataMapSchema.getProperties.get("full_refresh")) {
+          dataMapSchema.getProperties.get("full_refresh").toBoolean
+        } else {
+          false
+        }
+      if (isFullRefresh) {
+        isOverwriteTable = true
+      }
+      // Set specified segments for incremental load
+      val segmentMapIterator = segmentMap.entrySet().iterator()
+      while (segmentMapIterator.hasNext) {
+        val entry = segmentMapIterator.next()
+        setSegmentsToLoadDataMap(entry.getKey, entry.getValue)
+      }
+      val header = dataMapTable.getTableInfo.getFactTable.getListOfColumns.asScala
+        .filter { column =>
+          !column.getColumnName
+            .equalsIgnoreCase(CarbonCommonConstants.DEFAULT_INVISIBLE_DUMMY_MEASURE)
+        }.sortBy(_.getSchemaOrdinal).map(_.getColumnName).mkString(",")
       val loadCommand = CarbonLoadDataCommand(
         databaseNameOp = Some(identifier.getDatabaseName),
         tableName = identifier.getTableName,
         factPathFromUser = null,
         dimFilesPath = Seq(),
         options = scala.collection.immutable.Map("fileheader" -> header),
-        isOverwriteTable = true,
+        isOverwriteTable,
         inputSqlString = null,
         dataFrame = Some(queryPlan),
         updateModel = None,
         tableInfoOp = None,
-        internalOptions = Map.empty,
+        internalOptions = Map("mergedSegmentName" -> newLoadName,
+          CarbonCommonConstants.IS_INTERNAL_LOAD_CALL -> "true"),
         partition = Map.empty)
 
-      SparkSQLUtil.execute(loadCommand, sparkSession)
+      try {
+        SparkSQLUtil.execute(loadCommand, sparkSession)
+      } catch {
+        case ex: Exception =>
+          // If load to dataMap table fails, disable the dataMap and if newLoad is still
+          // in INSERT_IN_PROGRESS state, mark for delete the newLoad and update table status file
+          DataMapStatusManager.disableDataMap(dataMapSchema.getDataMapName)
+          LOGGER.error("Data Load failed for DataMap: ", ex)
+          CarbonLoaderUtil.updateTableStatusInCaseOfFailure(
+            newLoadName,
+            dataMapTable.getAbsoluteTableIdentifier,
+            dataMapTable.getTableName,
+            dataMapTable.getDatabaseName,
+            dataMapTable.getTablePath,
+            dataMapTable.getMetadataPath)
+          throw ex
+      } finally {
+        unsetMainTableSegments()
+      }
     }
+    true
   }
 
-  @throws[IOException]
-  override def incrementalBuild(
-      segmentIds: Array[String]): Unit = {
-    throw new UnsupportedOperationException
+  /**
+   * This method will set main table segments which needs to be loaded to mv dataMap
+   */
+  private def setSegmentsToLoadDataMap(tableUniqueName: String,
+      mainTableSegmentList: java.util.List[String]): Unit = {
+    CarbonSession
+      .threadSet(CarbonCommonConstants.CARBON_INPUT_SEGMENTS +
+                 tableUniqueName, mainTableSegmentList.asScala.mkString(","))
+  }
+
+  private def unsetMainTableSegments(): Unit = {
+    val relationIdentifiers = dataMapSchema.getParentTables.asScala
+    for (relationIdentifier <- relationIdentifiers) {
+      CarbonSession
+        .threadUnset(CarbonCommonConstants.CARBON_INPUT_SEGMENTS +
+                     relationIdentifier.getDatabaseName + "." +
+                     relationIdentifier.getTableName)
+    }
   }
 
   override def createDataMapCatalog : DataMapCatalog[SummaryDataset] =

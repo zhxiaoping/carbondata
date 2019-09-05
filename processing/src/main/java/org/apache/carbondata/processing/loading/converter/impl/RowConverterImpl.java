@@ -28,6 +28,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import org.apache.carbondata.common.logging.LogServiceFactory;
+import org.apache.carbondata.core.constants.CarbonLoadOptionConstants;
 import org.apache.carbondata.core.datastore.row.CarbonRow;
 import org.apache.carbondata.core.dictionary.client.DictionaryClient;
 import org.apache.carbondata.core.dictionary.service.DictionaryOnePassService;
@@ -106,7 +107,9 @@ public class RowConverterImpl implements RowConverter {
       FieldConverter fieldConverter = FieldEncoderFactory.getInstance()
           .createFieldEncoder(fields[i], configuration.getTableIdentifier(), i, nullFormat, client,
               configuration.getUseOnePass(), localCaches[i], isEmptyBadRecord,
-              configuration.getParentTablePath(), isConvertToBinary);
+              configuration.getParentTablePath(), isConvertToBinary,
+              (String) configuration.getDataLoadProperty(
+                  CarbonLoadOptionConstants.CARBON_OPTIONS_BINARY_DECODER));
       fieldConverterList.add(fieldConverter);
     }
     CarbonTimeStatisticsFactory.getLoadStatisticsInstance()
@@ -121,7 +124,7 @@ public class RowConverterImpl implements RowConverter {
       if (executorService == null) {
         executorService = Executors.newCachedThreadPool(new CarbonThreadFactory(
             "DictionaryClientPool:" + configuration.getTableIdentifier().getCarbonTableIdentifier()
-                .getTableName()));
+                .getTableName(), true));
       }
       DictionaryOnePassService
           .setDictionaryServiceProvider(configuration.getDictionaryServiceProvider());
@@ -227,7 +230,9 @@ public class RowConverterImpl implements RowConverter {
         fieldConverter = FieldEncoderFactory.getInstance()
             .createFieldEncoder(fields[i], configuration.getTableIdentifier(), i, nullFormat,
                 client, configuration.getUseOnePass(), localCaches[i], isEmptyBadRecord,
-                configuration.getParentTablePath(), isConvertToBinary);
+                configuration.getParentTablePath(), isConvertToBinary,
+                (String) configuration.getDataLoadProperty(
+                    CarbonLoadOptionConstants.CARBON_OPTIONS_BINARY_DECODER));
       } catch (IOException e) {
         throw new RuntimeException(e);
       }

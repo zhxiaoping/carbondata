@@ -80,20 +80,36 @@ public class SegmentFileStore {
    */
   public static void writeSegmentFile(String tablePath, final String taskNo, String location,
       String timeStamp, List<String> partionNames) throws IOException {
+    writeSegmentFile(tablePath, taskNo, location, timeStamp, partionNames, false);
+  }
+
+  /**
+   * Write segment information to the segment folder with indexfilename and
+   * corresponding partitions.
+   */
+  public static void writeSegmentFile(String tablePath, final String taskNo, String location,
+      String timeStamp, List<String> partionNames, boolean isMergeIndexFlow) throws IOException {
     String tempFolderLoc = timeStamp + ".tmp";
     String writePath = CarbonTablePath.getSegmentFilesLocation(tablePath) + "/" + tempFolderLoc;
     CarbonFile carbonFile = FileFactory.getCarbonFile(writePath);
     if (!carbonFile.exists()) {
       carbonFile.mkdirs(writePath);
     }
-    CarbonFile tempFolder =
-        FileFactory.getCarbonFile(location + CarbonCommonConstants.FILE_SEPARATOR + tempFolderLoc);
+    CarbonFile tempFolder = null;
+    if (isMergeIndexFlow) {
+      tempFolder = FileFactory.getCarbonFile(location);
+    } else {
+      tempFolder = FileFactory
+          .getCarbonFile(location + CarbonCommonConstants.FILE_SEPARATOR + tempFolderLoc);
+    }
 
-    if (tempFolder.exists() && partionNames.size() > 0) {
+    if ((tempFolder.exists() && partionNames.size() > 0) || (isMergeIndexFlow
+        && partionNames.size() > 0)) {
       CarbonFile[] carbonFiles = tempFolder.listFiles(new CarbonFileFilter() {
         @Override public boolean accept(CarbonFile file) {
-          return file.getName().startsWith(taskNo) && file.getName()
-              .endsWith(CarbonTablePath.INDEX_FILE_EXT);
+          return file.getName().startsWith(taskNo) && (
+              file.getName().endsWith(CarbonTablePath.INDEX_FILE_EXT) || file.getName()
+                  .endsWith(CarbonTablePath.MERGE_INDEX_FILE_EXT));
         }
       });
       if (carbonFiles != null && carbonFiles.length > 0) {
@@ -108,10 +124,22 @@ public class SegmentFileStore {
         folderDetails.setPartitions(partionNames);
         folderDetails.setStatus(SegmentStatus.SUCCESS.getMessage());
         for (CarbonFile file : carbonFiles) {
-          folderDetails.getFiles().add(file.getName());
+          if (file.getName().endsWith(CarbonTablePath.MERGE_INDEX_FILE_EXT)) {
+            folderDetails.setMergeFileName(file.getName());
+          } else {
+            folderDetails.getFiles().add(file.getName());
+          }
         }
         segmentFile.addPath(location, folderDetails);
-        String path = writePath + "/" + taskNo + CarbonTablePath.SEGMENT_EXT;
+        String path = null;
+        if (isMergeIndexFlow) {
+          // in case of merge index flow, tasks are launched per partition and all the tasks
+          // will be writting to the same tmp folder, in that case taskNo is not unique.
+          // To generate a unique fileName UUID is used
+          path = writePath + "/" + CarbonUtil.generateUUID() + CarbonTablePath.SEGMENT_EXT;
+        } else {
+          path = writePath + "/" + taskNo + CarbonTablePath.SEGMENT_EXT;
+        }
         // write segment info to new file.
         writeSegmentFile(segmentFile, path);
       }
@@ -139,12 +167,32 @@ public class SegmentFileStore {
    */
   public static String writeSegmentFile(CarbonTable carbonTable, String segmentId, String UUID)
       throws IOException {
+    return writeSegmentFile(carbonTable, segmentId, UUID, null);
+  }
+
+  /**
+   * Write segment file to the metadata folder of the table selecting only the current load files
+   *
+   * @param carbonTable
+   * @param segmentId
+   * @param UUID
+   * @param currentLoadTimeStamp
+   * @return
+   * @throws IOException
+   */
+  public static String writeSegmentFile(CarbonTable carbonTable, String segmentId, String UUID,
+      final String currentLoadTimeStamp) throws IOException {
     String tablePath = carbonTable.getTablePath();
     boolean supportFlatFolder = carbonTable.isSupportFlatFolder();
     String segmentPath = CarbonTablePath.getSegmentPath(tablePath, segmentId);
     CarbonFile segmentFolder = FileFactory.getCarbonFile(segmentPath);
     CarbonFile[] indexFiles = segmentFolder.listFiles(new CarbonFileFilter() {
       @Override public boolean accept(CarbonFile file) {
+        if (null != currentLoadTimeStamp) {
+          return file.getName().contains(currentLoadTimeStamp) && (
+              file.getName().endsWith(CarbonTablePath.INDEX_FILE_EXT) || file.getName()
+                  .endsWith(CarbonTablePath.MERGE_INDEX_FILE_EXT));
+        }
         return (file.getName().endsWith(CarbonTablePath.INDEX_FILE_EXT) || file.getName()
             .endsWith(CarbonTablePath.MERGE_INDEX_FILE_EXT));
       }
@@ -184,6 +232,7 @@ public class SegmentFileStore {
     }
     return null;
   }
+
 
   /**
    * Move the loaded data from source folder to destination folder.
@@ -342,13 +391,10 @@ public class SegmentFileStore {
    */
   public static void clearBlockDataMapCache(CarbonTable carbonTable, String segmentId) {
     TableDataMap defaultDataMap = DataMapStoreManager.getInstance().getDefaultDataMap(carbonTable);
-    Segment segment = new Segment(segmentId);
-    List<Segment> segments = new ArrayList<>();
-    segments.add(segment);
     LOGGER.info(
         "clearing cache while updating segment file entry in table status file for segmentId: "
             + segmentId);
-    defaultDataMap.clear(segments);
+    defaultDataMap.getDataMapFactory().clear(segmentId);
   }
 
   private static CarbonFile[] getSegmentFiles(String segmentPath) {
@@ -415,7 +461,7 @@ public class SegmentFileStore {
    * @param segmentFilePath
    * @return
    */
-  private static SegmentFile readSegmentFile(String segmentFilePath) throws IOException {
+  public static SegmentFile readSegmentFile(String segmentFilePath) throws IOException {
     Gson gsonObjectToRead = new Gson();
     DataInputStream dataInputStream = null;
     BufferedReader buffReader = null;
@@ -701,7 +747,7 @@ public class SegmentFileStore {
     if (toBeDeleteSegments.size() > 0 || toBeUpdatedSegments.size() > 0) {
       Set<Segment> segmentSet = new HashSet<>(
           new SegmentStatusManager(carbonTable.getAbsoluteTableIdentifier())
-              .getValidAndInvalidSegments().getValidSegments());
+              .getValidAndInvalidSegments(carbonTable.isChildTable()).getValidSegments());
       CarbonUpdateUtil.updateTableMetadataStatus(segmentSet, carbonTable, uniqueId, true,
           Segment.toSegmentList(toBeDeleteSegments, null),
           Segment.toSegmentList(toBeUpdatedSegments, null), uuid);
@@ -845,10 +891,7 @@ public class SegmentFileStore {
           }
         }
         CarbonFile path = FileFactory.getCarbonFile(location.getParent().toString());
-        if (path.listFiles().length == 0) {
-          FileFactory.deleteAllCarbonFilesOfDir(
-              FileFactory.getCarbonFile(location.getParent().toString()));
-        }
+        deleteEmptyPartitionFolders(path);
       } else {
         Path location = new Path(entry.getKey()).getParent();
         // delete the segment folder
@@ -858,6 +901,22 @@ public class SegmentFileStore {
           FileFactory.deleteAllCarbonFilesOfDir(segmentPath);
         }
       }
+    }
+  }
+
+  /**
+   * This method deletes the directories recursively if there are no files under corresponding
+   * folder.
+   * Ex: If partition folder is year=2015, month=2,day=5 and drop partition is day=5, it will delete
+   * till year partition folder if there are no other folder or files present under each folder till
+   * year partition
+   */
+  private static void deleteEmptyPartitionFolders(CarbonFile path) {
+    if (path != null && path.listFiles().length == 0) {
+      FileFactory.deleteAllCarbonFilesOfDir(path);
+      Path parentsLocation = new Path(path.getAbsolutePath()).getParent();
+      deleteEmptyPartitionFolders(
+          FileFactory.getCarbonFile(parentsLocation.toString()));
     }
   }
 
@@ -878,11 +937,10 @@ public class SegmentFileStore {
    * @return
    * @throws IOException
    */
-  public static List<PartitionSpec> getPartitionSpecs(String segmentId, String tablePath)
+  public static List<PartitionSpec> getPartitionSpecs(String segmentId, String tablePath,
+      LoadMetadataDetails[] details)
       throws IOException {
     LoadMetadataDetails segEntry = null;
-    LoadMetadataDetails[] details =
-        SegmentStatusManager.readLoadMetadata(CarbonTablePath.getMetadataPath(tablePath));
     for (LoadMetadataDetails entry : details) {
       if (entry.getLoadName().equals(segmentId)) {
         segEntry = entry;

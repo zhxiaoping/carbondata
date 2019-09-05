@@ -61,7 +61,7 @@ class FGDataMapFactory(carbonTable: CarbonTable,
   }
 
   /**
-   * Get the datamap for segmentid
+   * Get the datamap for segmentId
    */
   override def getDataMaps(segment: Segment): java.util.List[FineGrainDataMap] = {
     val path = CarbonTablePath.getSegmentPath(carbonTable.getTablePath, segment.getSegmentNo)
@@ -86,7 +86,7 @@ class FGDataMapFactory(carbonTable: CarbonTable,
   }
 
   /**
-   * Get all distributable objects of a segmentid
+   * Get all distributable objects of a segmentId
    *
    * @return
    */
@@ -98,6 +98,8 @@ class FGDataMapFactory(carbonTable: CarbonTable,
     val files = file.listFiles()
     files.map { f =>
       val d: DataMapDistributable = new BlockletDataMapDistributable(f.getCanonicalPath)
+      d.setSegment(segment)
+      d.setDataMapSchema(getDataMapSchema)
       d
     }.toList.asJava
   }
@@ -108,12 +110,6 @@ class FGDataMapFactory(carbonTable: CarbonTable,
    */
   override def fireEvent(event: Event):Unit = {
     ???
-  }
-
-  /**
-   * Clears datamap of the segment
-   */
-  override def clear(segment: Segment): Unit = {
   }
 
   /**
@@ -569,12 +565,12 @@ class FGDataMapTestCase extends QueryTest with BeforeAndAfterAll {
   }
 
   override protected def afterAll(): Unit = {
-    CompactionSupportGlobalSortBigFileTest.deleteFile(file2)
-    sql("DROP TABLE IF EXISTS normal_test")
-    sql("DROP TABLE IF EXISTS datamap_test")
-    sql("DROP TABLE IF EXISTS datamap_testFG")
-    CarbonProperties.getInstance()
-      .addProperty(CarbonCommonConstants.ENABLE_QUERY_STATISTICS,
-        CarbonCommonConstants.ENABLE_QUERY_STATISTICS_DEFAULT)
+//    CompactionSupportGlobalSortBigFileTest.deleteFile(file2)
+//    sql("DROP TABLE IF EXISTS normal_test")
+//    sql("DROP TABLE IF EXISTS datamap_test")
+//    sql("DROP TABLE IF EXISTS datamap_testFG")
+//    CarbonProperties.getInstance()
+//      .addProperty(CarbonCommonConstants.ENABLE_QUERY_STATISTICS,
+//        CarbonCommonConstants.ENABLE_QUERY_STATISTICS_DEFAULT)
   }
 }

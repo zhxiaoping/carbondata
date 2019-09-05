@@ -26,6 +26,8 @@ import org.apache.spark.sql.{CarbonDatasourceHadoopRelation, CarbonEnv, Row}
 import org.apache.spark.sql.test.util.QueryTest
 import org.scalatest.BeforeAndAfterAll
 
+import org.apache.carbondata.core.datastore.impl.FileFactory
+
 class StandardPartitionWithPreaggregateTestCase extends QueryTest with BeforeAndAfterAll {
 
   val testData = s"$resourcesPath/sample.csv"
@@ -223,6 +225,26 @@ class StandardPartitionWithPreaggregateTestCase extends QueryTest with BeforeAnd
     sql("alter table partitionone drop partition(day=1)")
     checkAnswer(sql("select * from partitionone"), Seq(Row("k",2014,1,2), Row("k",2015,2,3)))
     checkAnswer(sql("select * from partitionone_p1"), Seq(Row("k",2014,2014,1,2), Row("k",2015,2015,2,3)))
+  }
+
+  test("test drop partition directory") {
+    sql("drop table if exists droppartition")
+    sql(
+      """
+        | CREATE TABLE if not exists droppartition (empname String)
+        | PARTITIONED BY (year int, month int,day int)
+        | STORED BY 'org.apache.carbondata.format'
+      """.stripMargin)
+    sql("insert into droppartition values('k',2014,1,1)")
+    sql("insert into droppartition values('k',2015,2,3)")
+    sql("alter table droppartition drop partition(year=2015,month=2,day=3)")
+    sql("clean files for table droppartition")
+    val table = CarbonEnv.getCarbonTable(Option("partition_preaggregate"), "droppartition")(sqlContext.sparkSession)
+    val tablePath = table.getTablePath
+    val carbonFiles = FileFactory.getCarbonFile(tablePath).listFiles().filter{
+      file => file.getName.equalsIgnoreCase("year=2015")
+    }
+    assert(carbonFiles.length == 0)
   }
 
   test("test data with filter query") {
@@ -615,6 +637,16 @@ class StandardPartitionWithPreaggregateTestCase extends QueryTest with BeforeAnd
     assert(!CarbonEnv.getCarbonTable(Some("partition_preaggregate"),"partitionone_p5")(sqlContext.sparkSession).isHivePartitionTable)
     assert(!CarbonEnv.getCarbonTable(Some("partition_preaggregate"),"partitionone_p6")(sqlContext.sparkSession).isHivePartitionTable)
     assert(!CarbonEnv.getCarbonTable(Some("partition_preaggregate"),"partitionone_p7")(sqlContext.sparkSession).isHivePartitionTable)
+  }
+
+  test("test partition at last column") {
+    sql("drop table if exists partitionone")
+    sql("create table partitionone(a int,b int) partitioned by (c int) stored by 'carbondata'")
+    sql("insert into partitionone values(1,2,3)")
+    sql("drop datamap if exists dm1")
+    sql("create datamap dm1 on table partitionone using 'preaggregate' as select c,sum(b) from partitionone group by c")
+    checkAnswer(sql("select c,sum(b) from partitionone group by c"), Seq(Row(3,2)))
+    sql("drop table if exists partitionone")
   }
 
   def preAggTableValidator(plan: LogicalPlan, actualTableName: String) : Unit = {

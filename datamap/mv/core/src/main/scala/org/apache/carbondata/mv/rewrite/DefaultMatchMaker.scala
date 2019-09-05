@@ -53,6 +53,14 @@ abstract class DefaultMatchPattern extends MatchPattern[ModularPlan] {
             (a.child.asInstanceOf[Attribute], a.toAttribute)
           })
 
+    // Create aliasMap with Expression to alias reference attribute
+    val aliasMapExp =
+      subsumer.outputList.collect {
+        case a: Alias if a.child.isInstanceOf[Expression] &&
+                         !a.child.isInstanceOf[AggregateExpression] =>
+          a.child -> a.toAttribute
+      }.toMap
+
     // Check and replace all alias references with subsumer alias map references.
     val compensation1 = compensation.transform {
       case plan if !plan.skip && plan != subsumer =>
@@ -65,6 +73,14 @@ abstract class DefaultMatchPattern extends MatchPattern[ModularPlan] {
                   ref.name, ref.dataType)(
                   exprId = ref.exprId,
                   qualifier = a.qualifier)
+              }.getOrElse(a)
+          case a: Expression =>
+            aliasMapExp
+              .get(a)
+              .map { ref =>
+                AttributeReference(
+                  ref.name, ref.dataType)(
+                  exprId = ref.exprId)
               }.getOrElse(a)
           }
     }
@@ -124,7 +140,10 @@ object SelectSelectNoChildDelta extends DefaultMatchPattern with PredicateHelper
           exprListR.exists(a1 => a1.isInstanceOf[Alias] &&
                                  a1.asInstanceOf[Alias].child.semanticEquals(a.child)) ||
           exprListR.exists(_.semanticEquals(exprE) || canEvaluate(exprE, subsumer))
-        case exp => exprListR.exists(_.semanticEquals(exp) || canEvaluate(exp, subsumer))
+        case exp =>
+          exprListR.exists(a1 => a1.isInstanceOf[Alias] &&
+                                 a1.asInstanceOf[Alias].child.semanticEquals(exp)) ||
+          exprListR.exists(_.semanticEquals(exprE) || canEvaluate(exprE, subsumer))
       }
     } else {
       false
@@ -162,8 +181,14 @@ object SelectSelectNoChildDelta extends DefaultMatchPattern with PredicateHelper
         // are 1-1 correspondence.
         // Change the following two conditions to more complicated ones if we want to
         // consider things that combine extrajoin, rejoin, and harmonized relations
-        val isUniqueRmE = subsumer.children.filter { x => subsumee.children.count(_ == x) != 1 }
-        val isUniqueEmR = subsumee.children.filter { x => subsumer.children.count(_ == x) != 1 }
+        val isUniqueRmE = subsumer.children.filter { x => subsumee.children.count{
+          case relation: ModularRelation => relation.fineEquals(x)
+          case other => other == x
+        } != 1 }
+        val isUniqueEmR = subsumee.children.filter { x => subsumer.children.count{
+          case relation: ModularRelation => relation.fineEquals(x)
+          case other => other == x
+        } != 1 }
 
         val extrajoin = sel_1a.children.filterNot { child => sel_1q.children.contains(child) }
         val rejoin = sel_1q.children.filterNot { child => sel_1a.children.contains(child) }
@@ -173,14 +198,19 @@ object SelectSelectNoChildDelta extends DefaultMatchPattern with PredicateHelper
           sel_1q.predicateList.exists(_.semanticEquals(expr)))
         val isPredicateEmdR = sel_1q.predicateList.forall(expr =>
           isDerivable(expr, sel_1a.outputList ++ rejoinOutputList, sel_1q, sel_1a, None))
-        val isOutputEdR = sel_1q.outputList.forall(expr =>
+        // Check if sel_1q.outputList is non empty and then check whether
+        // it can be derivable with sel_1a otherwise for empty cases it returns true.
+        val isOutputEdR = sel_1q.outputList.nonEmpty && sel_1q.outputList.forall(expr =>
           isDerivable(expr, sel_1a.outputList ++ rejoinOutputList, sel_1q, sel_1a, None))
 
         if (isUniqueRmE.isEmpty && isUniqueEmR.isEmpty && extrajoin.isEmpty && isPredicateRmE &&
             isPredicateEmdR && isOutputEdR) {
           val mappings = sel_1a.children.zipWithIndex.map {
             case (childr, fromIdx) if sel_1q.children.contains(childr) =>
-              val toIndx = sel_1q.children.indexWhere(_ == childr)
+              val toIndx = sel_1q.children.indexWhere{
+                case relation: ModularRelation => relation.fineEquals(childr)
+                case other => other == childr
+              }
               (toIndx -> fromIdx)
 
           }
@@ -233,8 +263,7 @@ object SelectSelectNoChildDelta extends DefaultMatchPattern with PredicateHelper
               val tChildren = new collection.mutable.ArrayBuffer[ModularPlan]()
               val tAliasMap = new collection.mutable.HashMap[Int, String]()
 
-              val updatedOutList: Seq[NamedExpression] = updateDuplicateColumns(sel_1a)
-              val usel_1a = sel_1a.copy(outputList = updatedOutList)
+              val usel_1a = sel_1a.copy(outputList = sel_1a.outputList)
               tChildren += usel_1a
               tAliasMap += (tChildren.indexOf(usel_1a) -> rewrite.newSubsumerName())
 
@@ -339,18 +368,6 @@ object SelectSelectNoChildDelta extends DefaultMatchPattern with PredicateHelper
     }
   }
 
-  private def updateDuplicateColumns(sel_1a: Select) = {
-    val duplicateNameCols = sel_1a.outputList.groupBy(_.name).filter(_._2.length > 1).flatMap(_._2)
-      .toList
-    val updatedOutList = sel_1a.outputList.map { col =>
-      if (duplicateNameCols.contains(col)) {
-        Alias(col, col.qualifiedName)(exprId = col.exprId)
-      } else {
-        col
-      }
-    }
-    updatedOutList
-  }
 }
 
 object GroupbyGroupbyNoChildDelta extends DefaultMatchPattern {

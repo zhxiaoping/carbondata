@@ -196,7 +196,7 @@ object PreAggregateUtil {
       parentDatabaseName: String,
       carbonTable: CarbonTable) : ColumnTableRelation = {
     val parentColumnId = carbonTable.getColumnByName(parentTableName, parentColumnName).getColumnId
-    val columnTableRelation = ColumnTableRelation(parentColumnName = parentColumnName,
+    val columnTableRelation = ColumnTableRelation(parentColumnName = parentColumnName.toLowerCase(),
       parentColumnId = parentColumnId,
       parentTableName = parentTableName,
       parentDatabaseName = parentDatabaseName, parentTableId = parentTableId)
@@ -386,13 +386,14 @@ object PreAggregateUtil {
       aggregateType: String = "",
       parentTableName: String,
       columnTableRelationList: Seq[ColumnTableRelation]): (Field, DataMapField) = {
-    val actualColumnName = if (aggregateType.equals("")) {
+    var actualColumnName = if (aggregateType.equals("")) {
       parentTableName + '_' + columnName
     } else {
       parentTableName + '_' + columnName + '_' + aggregateType
     }
     val rawSchema = '`' + actualColumnName + '`' + ' ' + dataType.typeName
     val dataMapField = DataMapField(aggregateType, Some(columnTableRelationList))
+    actualColumnName = actualColumnName.toLowerCase()
     if (dataType.typeName.startsWith("decimal")) {
       val (precision, scale) = CommonUtil.getScaleAndPrecision(dataType.catalogString)
       (Field(column = actualColumnName,
@@ -470,7 +471,7 @@ object PreAggregateUtil {
     val dbName = carbonTable.getDatabaseName
     val tableName = carbonTable.getTableName
     CarbonEnv.getInstance(sparkSession).carbonMetaStore
-      .updateTableSchemaForDataMap(carbonTable.getCarbonTableIdentifier,
+      .updateTableSchema(carbonTable.getCarbonTableIdentifier,
         carbonTable.getCarbonTableIdentifier,
         thriftTable,
         carbonTable.getAbsoluteTableIdentifier.getTablePath)(sparkSession)
@@ -535,23 +536,6 @@ object PreAggregateUtil {
     if (thriftTable.dataMapSchemas.size > numberOfChildSchema) {
       metastore.revertTableSchemaForPreAggCreationFailure(
         carbonTable.getAbsoluteTableIdentifier, thriftTable)(sparkSession)
-    }
-  }
-
-  def getChildCarbonTable(databaseName: String, tableName: String)
-    (sparkSession: SparkSession): Option[CarbonTable] = {
-    val metaStore = CarbonEnv.getInstance(sparkSession).carbonMetaStore
-    val carbonTable = metaStore.getTableFromMetadataCache(databaseName, tableName)
-    if (carbonTable.isEmpty) {
-      try {
-        Some(metaStore.lookupRelation(Some(databaseName), tableName)(sparkSession)
-          .asInstanceOf[CarbonRelation].metaData.carbonTable)
-      } catch {
-        case _: Exception =>
-          None
-      }
-    } else {
-      carbonTable
     }
   }
 

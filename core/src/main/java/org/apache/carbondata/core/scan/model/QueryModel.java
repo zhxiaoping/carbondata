@@ -18,25 +18,23 @@
 package org.apache.carbondata.core.scan.model;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.carbondata.core.cache.dictionary.Dictionary;
-import org.apache.carbondata.core.constants.CarbonCommonConstants;
 import org.apache.carbondata.core.datastore.block.TableBlockInfo;
 import org.apache.carbondata.core.metadata.AbsoluteTableIdentifier;
 import org.apache.carbondata.core.metadata.schema.table.CarbonTable;
 import org.apache.carbondata.core.metadata.schema.table.column.CarbonColumn;
 import org.apache.carbondata.core.metadata.schema.table.column.CarbonDimension;
 import org.apache.carbondata.core.metadata.schema.table.column.CarbonMeasure;
-import org.apache.carbondata.core.mutate.UpdateVO;
 import org.apache.carbondata.core.scan.expression.ColumnExpression;
 import org.apache.carbondata.core.scan.expression.Expression;
 import org.apache.carbondata.core.scan.expression.UnknownExpression;
 import org.apache.carbondata.core.scan.expression.conditional.ConditionalExpression;
 import org.apache.carbondata.core.scan.filter.resolver.FilterResolverIntf;
 import org.apache.carbondata.core.stats.QueryStatisticsRecorder;
+import org.apache.carbondata.core.util.CarbonProperties;
 import org.apache.carbondata.core.util.CarbonUtil;
 import org.apache.carbondata.core.util.DataTypeConverter;
 
@@ -92,15 +90,6 @@ public class QueryModel {
 
   private DataTypeConverter converter;
 
-  /**
-   * Invalid table blocks, which need to be removed from
-   * memory, invalid blocks can be segment which are deleted
-   * or compacted
-   */
-  private List<String> invalidSegmentIds;
-  private Map<String, UpdateVO> invalidSegmentBlockIdMap =
-      new HashMap<>(CarbonCommonConstants.DEFAULT_COLLECTION_SIZE);
-
   private boolean[] isFilterDimensions;
   private boolean[] isFilterMeasures;
 
@@ -122,7 +111,7 @@ public class QueryModel {
   // whether to clear/free unsafe memory or not
   private boolean freeUnsafeMemory = true;
 
-  private boolean preFetchData = true;
+  private boolean preFetchData;
 
   /**
    * It fills the vector directly from decoded column page with out any staging and conversions.
@@ -135,9 +124,9 @@ public class QueryModel {
 
   private QueryModel(CarbonTable carbonTable) {
     tableBlockInfos = new ArrayList<TableBlockInfo>();
-    invalidSegmentIds = new ArrayList<>();
     this.table = carbonTable;
     this.queryId = String.valueOf(System.nanoTime());
+    this.preFetchData = CarbonProperties.getQueryPrefetchEnable();
   }
 
   public static QueryModel newInstance(CarbonTable carbonTable) {
@@ -350,29 +339,12 @@ public class QueryModel {
     this.statisticsRecorder = statisticsRecorder;
   }
 
-  public List<String> getInvalidSegmentIds() {
-    return invalidSegmentIds;
-  }
-
-  public void setInvalidSegmentIds(List<String> invalidSegmentIds) {
-    this.invalidSegmentIds = invalidSegmentIds;
-  }
-
   public boolean isVectorReader() {
     return vectorReader;
   }
 
   public void setVectorReader(boolean vectorReader) {
     this.vectorReader = vectorReader;
-  }
-  public void setInvalidBlockForSegmentId(List<UpdateVO> invalidSegmentTimestampList) {
-    for (UpdateVO anUpdateVO : invalidSegmentTimestampList) {
-      this.invalidSegmentBlockIdMap.put(anUpdateVO.getSegmentId(), anUpdateVO);
-    }
-  }
-
-  public Map<String,UpdateVO>  getInvalidBlockVOForSegmentId() {
-    return  invalidSegmentBlockIdMap;
   }
 
   public DataTypeConverter getConverter() {

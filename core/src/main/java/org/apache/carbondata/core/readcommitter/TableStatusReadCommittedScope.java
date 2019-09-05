@@ -55,7 +55,7 @@ public class TableStatusReadCommittedScope implements ReadCommittedScope {
   }
 
   public TableStatusReadCommittedScope(AbsoluteTableIdentifier identifier,
-      LoadMetadataDetails[] loadMetadataDetails, Configuration configuration) throws IOException {
+      LoadMetadataDetails[] loadMetadataDetails, Configuration configuration) {
     this.identifier = identifier;
     this.configuration = configuration;
     this.loadMetadataDetails = loadMetadataDetails;
@@ -111,5 +111,9 @@ public class TableStatusReadCommittedScope implements ReadCommittedScope {
 
   @Override public void setConfiguration(Configuration configuration) {
     this.configuration = configuration;
+  }
+
+  @Override public String getFilePath() {
+    return identifier.getTablePath();
   }
 }

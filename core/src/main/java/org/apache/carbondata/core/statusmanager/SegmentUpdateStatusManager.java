@@ -442,29 +442,22 @@ public class SegmentUpdateStatusManager {
   /**
    * Returns all update delta files of specified Segment.
    *
-   * @param segmentId
+   * @param loadMetadataDetail metadatadetails of segment
    * @param validUpdateFiles if true then only the valid range files will be returned.
    * @return
    */
-  public CarbonFile[] getUpdateDeltaFilesList(String segmentId, final boolean validUpdateFiles,
-      final String fileExtension, final boolean excludeOriginalFact,
+  public CarbonFile[] getUpdateDeltaFilesList(LoadMetadataDetails loadMetadataDetail,
+      final boolean validUpdateFiles, final String fileExtension, final boolean excludeOriginalFact,
       CarbonFile[] allFilesOfSegment, boolean isAbortedFile) {
 
     String endTimeStamp = "";
     String startTimeStamp = "";
     long factTimeStamp = 0;
 
-    LoadMetadataDetails[] segmentDetails = SegmentStatusManager.readLoadMetadata(
-        CarbonTablePath.getMetadataPath(identifier.getTablePath()));
-
-    for (LoadMetadataDetails eachSeg : segmentDetails) {
-      if (eachSeg.getLoadName().equalsIgnoreCase(segmentId)) {
-        // if the segment is found then take the start and end time stamp.
-        startTimeStamp = eachSeg.getUpdateDeltaStartTimestamp();
-        endTimeStamp = eachSeg.getUpdateDeltaEndTimestamp();
-        factTimeStamp = eachSeg.getLoadStartTime();
-      }
-    }
+    // if the segment is found then take the start and end time stamp.
+    startTimeStamp = loadMetadataDetail.getUpdateDeltaStartTimestamp();
+    endTimeStamp = loadMetadataDetail.getUpdateDeltaEndTimestamp();
+    factTimeStamp = loadMetadataDetail.getLoadStartTime();
 
     // if start timestamp is empty then no update delta is found. so return empty list.
     if (startTimeStamp.isEmpty()) {
@@ -779,32 +772,6 @@ public class SegmentUpdateStatusManager {
       }
     }
     return range;
-  }
-
-  /**
-   * Returns the invalid timestamp range of a segment.
-   * @return
-   */
-  public List<UpdateVO> getInvalidTimestampRange() {
-    List<UpdateVO> ranges = new ArrayList<UpdateVO>();
-    for (LoadMetadataDetails segment : segmentDetails) {
-      if ((SegmentStatus.LOAD_FAILURE == segment.getSegmentStatus()
-          || SegmentStatus.COMPACTED == segment.getSegmentStatus()
-          || SegmentStatus.MARKED_FOR_DELETE == segment.getSegmentStatus())) {
-        UpdateVO range = new UpdateVO();
-        range.setSegmentId(segment.getLoadName());
-        range.setFactTimestamp(segment.getLoadStartTime());
-        if (!segment.getUpdateDeltaStartTimestamp().isEmpty() &&
-            !segment.getUpdateDeltaEndTimestamp().isEmpty()) {
-          range.setUpdateDeltaStartTimestamp(
-              CarbonUpdateUtil.getTimeStampAsLong(segment.getUpdateDeltaStartTimestamp()));
-          range.setLatestUpdateTimestamp(
-              CarbonUpdateUtil.getTimeStampAsLong(segment.getUpdateDeltaEndTimestamp()));
-        }
-        ranges.add(range);
-      }
-    }
-    return ranges;
   }
 
   /**

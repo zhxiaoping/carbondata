@@ -143,6 +143,7 @@ public class SessionParams implements Serializable, Cloneable {
       case ENABLE_UNSAFE_IN_QUERY_EXECUTION:
       case ENABLE_AUTO_LOAD_MERGE:
       case CARBON_PUSH_ROW_FILTERS_FOR_VECTOR:
+      case CARBON_ENABLE_INDEX_SERVER:
         isValid = CarbonUtil.validateBoolean(value);
         if (!isValid) {
           throw new InvalidConfigurationException("Invalid value " + value + " for key " + key);
@@ -203,7 +204,9 @@ public class SessionParams implements Serializable, Cloneable {
         isValid = true;
         break;
       default:
-        if (key.startsWith(CarbonCommonConstants.CARBON_INPUT_SEGMENTS)) {
+        if (key.startsWith(CARBON_ENABLE_INDEX_SERVER) && key.split("\\.").length == 6) {
+          isValid = true;
+        } else if (key.startsWith(CarbonCommonConstants.CARBON_INPUT_SEGMENTS)) {
           isValid = CarbonUtil.validateRangeOfSegmentList(value);
           if (!isValid) {
             throw new InvalidConfigurationException("Invalid CARBON_INPUT_SEGMENT_IDs");

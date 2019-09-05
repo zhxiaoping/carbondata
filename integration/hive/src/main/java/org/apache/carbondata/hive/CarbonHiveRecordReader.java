@@ -47,6 +47,8 @@ import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
 import org.apache.hadoop.io.ArrayWritable;
+import org.apache.hadoop.io.BooleanWritable;
+import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
@@ -103,7 +105,7 @@ class CarbonHiveRecordReader extends CarbonRecordReader<ArrayWritable>
       valueObj = new ArrayWritable(Writable.class, new Writable[columnTypes.size()]);
     }
 
-    if (!colIds.equals("")) {
+    if (null != colIds && !colIds.equals("")) {
       String[] arraySelectedColId = colIds.split(",");
       columnIds = new int[arraySelectedColId.length];
       int columnId = 0;
@@ -204,6 +206,12 @@ class CarbonHiveRecordReader extends CarbonRecordReader<ArrayWritable>
         return new LongWritable((long) obj);
       case SHORT:
         return new ShortWritable((short) obj);
+      case BOOLEAN:
+        return new BooleanWritable((boolean) obj);
+      case VARCHAR:
+        return new Text(obj.toString());
+      case BINARY:
+        return new BytesWritable((byte[]) obj);
       case DATE:
         return new DateWritable(new Date(Long.parseLong(String.valueOf(obj.toString()))));
       case TIMESTAMP:

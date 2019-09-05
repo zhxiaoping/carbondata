@@ -54,6 +54,7 @@ import org.apache.carbondata.core.datastore.compression.CompressorFactory
 import org.apache.carbondata.core.datastore.filesystem.CarbonFile
 import org.apache.carbondata.core.datastore.impl.FileFactory
 import org.apache.carbondata.core.dictionary.server.DictionaryServer
+import org.apache.carbondata.core.exception.ConcurrentOperationException
 import org.apache.carbondata.core.locks.{CarbonLockFactory, ICarbonLock, LockUsage}
 import org.apache.carbondata.core.metadata.{CarbonTableIdentifier, ColumnarFormatVersion, SegmentFileStore}
 import org.apache.carbondata.core.metadata.datatype.DataTypes
@@ -65,6 +66,7 @@ import org.apache.carbondata.core.statusmanager.{LoadMetadataDetails, SegmentSta
 import org.apache.carbondata.core.util.{ByteUtil, CarbonProperties, CarbonUtil, ThreadLocalSessionInfo}
 import org.apache.carbondata.core.util.path.CarbonTablePath
 import org.apache.carbondata.events.{OperationContext, OperationListenerBus}
+import org.apache.carbondata.indexserver.IndexServer
 import org.apache.carbondata.processing.exception.DataLoadingException
 import org.apache.carbondata.processing.loading.FailureCauses
 import org.apache.carbondata.processing.loading.csvinput.{BlockDetails, CSVInputFormat, StringArrayWritable}
@@ -252,6 +254,20 @@ object CarbonDataRDDFactory {
                 skipCompactionTables.asJava)
             }
           }
+          // Remove compacted segments from executor cache.
+          if (CarbonProperties.getInstance().isDistributedPruningEnabled(
+              carbonLoadModel.getDatabaseName, carbonLoadModel.getTableName)) {
+            try {
+              IndexServer.getClient.invalidateSegmentCache(carbonLoadModel
+                .getCarbonDataLoadSchema.getCarbonTable,
+                compactedSegments.asScala.toArray,
+                SparkSQLUtil.getTaskGroupId(sqlContext.sparkSession))
+            } catch {
+              case ex: Exception =>
+                LOGGER.warn(s"Clear cache job has failed for ${carbonLoadModel
+                  .getDatabaseName}.${carbonLoadModel.getTableName}", ex)
+            }
+          }
           // giving the user his error for telling in the beeline if his triggered table
           // compaction is failed.
           if (!triggeredCompactionStatus) {
@@ -260,7 +276,9 @@ object CarbonDataRDDFactory {
         } finally {
           executor.shutdownNow()
           compactor.deletePartialLoadsInCompaction()
-          compactionLock.unlock()
+          if (compactionModel.compactionType != CompactionType.IUD_UPDDEL_DELTA) {
+            compactionLock.unlock()
+          }
         }
       }
     }
@@ -502,6 +520,7 @@ object CarbonDataRDDFactory {
       val newEntryLoadStatus =
         if (carbonLoadModel.isCarbonTransactionalTable &&
             !carbonLoadModel.getCarbonDataLoadSchema.getCarbonTable.isChildDataMap &&
+            !carbonLoadModel.getCarbonDataLoadSchema.getCarbonTable.isChildTable &&
             !CarbonLoaderUtil.isValidSegment(carbonLoadModel, carbonLoadModel.getSegmentId.toInt)) {
           LOGGER.warn("Cannot write load metadata file as there is no data to load")
           SegmentStatus.MARKED_FOR_DELETE
@@ -867,27 +886,34 @@ object CarbonDataRDDFactory {
         val lock = CarbonLockFactory.getCarbonLockObj(
           carbonTable.getAbsoluteTableIdentifier,
           LockUsage.COMPACTION_LOCK)
-
-        if (lock.lockWithRetries()) {
-          LOGGER.info("Acquired the compaction lock.")
-          try {
-            startCompactionThreads(sqlContext,
-              carbonLoadModel,
-              storeLocation,
-              compactionModel,
-              lock,
-              compactedSegments,
-              operationContext
-            )
-          } catch {
-            case e: Exception =>
-              LOGGER.error(s"Exception in start compaction thread. ${ e.getMessage }")
-              lock.unlock()
-              throw e
+        val updateLock = CarbonLockFactory.getCarbonLockObj(carbonTable
+          .getAbsoluteTableIdentifier, LockUsage.UPDATE_LOCK)
+        try {
+          if (updateLock.lockWithRetries(3, 3)) {
+            if (lock.lockWithRetries()) {
+              LOGGER.info("Acquired the compaction lock.")
+              startCompactionThreads(sqlContext,
+                carbonLoadModel,
+                storeLocation,
+                compactionModel,
+                lock,
+                compactedSegments,
+                operationContext
+              )
+            } else {
+              LOGGER.error("Not able to acquire the compaction lock for table " +
+                           s"${ carbonLoadModel.getDatabaseName }.${ carbonLoadModel.getTableName}")
+            }
+          } else {
+            throw new ConcurrentOperationException(carbonTable, "update", "compaction")
           }
-        } else {
-          LOGGER.error("Not able to acquire the compaction lock for table " +
-                       s"${ carbonLoadModel.getDatabaseName }.${ carbonLoadModel.getTableName}")
+        } catch {
+          case e: Exception =>
+            LOGGER.error(s"Exception in start compaction thread.", e)
+            lock.unlock()
+            throw e
+        } finally {
+          updateLock.unlock()
         }
       }
     }
@@ -938,6 +964,15 @@ object CarbonDataRDDFactory {
       throw new Exception(errorMessage)
     } else {
       DataMapStatusManager.disableAllLazyDataMaps(carbonTable)
+      if (overwriteTable) {
+        val allDataMapSchemas = DataMapStoreManager.getInstance
+          .getDataMapSchemasOfTable(carbonTable).asScala
+          .filter(dataMapSchema => null != dataMapSchema.getRelationIdentifier &&
+                                   !dataMapSchema.isIndexDataMap).asJava
+        if (!allDataMapSchemas.isEmpty) {
+          DataMapStatusManager.truncateDataMap(allDataMapSchemas)
+        }
+      }
     }
     (done, metadataDetails)
   }

@@ -23,15 +23,18 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.catalog.SessionCatalog
 import org.apache.spark.sql.events.{MergeBloomIndexEventListener, MergeIndexEventListener}
+import org.apache.spark.sql.execution.command.cache._
+import org.apache.spark.sql.execution.command.mv._
 import org.apache.spark.sql.execution.command.preaaggregate._
 import org.apache.spark.sql.execution.command.timeseries.TimeSeriesFunction
 import org.apache.spark.sql.hive._
+import org.apache.spark.sql.profiler.Profiler
 
 import org.apache.carbondata.common.logging.LogServiceFactory
 import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.datamap.DataMapStoreManager
 import org.apache.carbondata.core.datastore.impl.FileFactory
-import org.apache.carbondata.core.metadata.AbsoluteTableIdentifier
+import org.apache.carbondata.core.metadata.{AbsoluteTableIdentifier, CarbonMetadata}
 import org.apache.carbondata.core.metadata.schema.table.CarbonTable
 import org.apache.carbondata.core.util._
 import org.apache.carbondata.datamap.{TextMatchMaxDocUDF, TextMatchUDF}
@@ -119,6 +122,7 @@ class CarbonEnv {
         initialized = true
       }
     }
+    Profiler.initialize(sparkSession.sparkContext)
     LOGGER.info("Initialize CarbonEnv completed...")
   }
 }
@@ -147,9 +151,10 @@ object CarbonEnv {
    * Method
    * 1. To initialize Listeners to their respective events in the OperationListenerBus
    * 2. To register common listeners
-   *
+   * 3. Only initialize once for all the listeners in case of concurrent scenarios we have given
+   * val, as val initializes once
    */
-  def init(sparkSession: SparkSession): Unit = {
+  val init = {
     initListeners
   }
 
@@ -172,6 +177,8 @@ object CarbonEnv {
       .addListener(classOf[LoadTablePreExecutionEvent], LoadPreAggregateTablePreListener)
       .addListener(classOf[AlterTableCompactionPreStatusUpdateEvent],
         AlterPreAggregateTableCompactionPostListener)
+      .addListener(classOf[AlterTableCompactionPreStatusUpdateEvent],
+        AlterDataMaptableCompactionPostListener)
       .addListener(classOf[LoadMetadataEvent], LoadProcessMetaListener)
       .addListener(classOf[LoadMetadataEvent], CompactionProcessMetaListener)
       .addListener(classOf[LoadTablePostStatusUpdateEvent], CommitPreAggregateListener)
@@ -181,10 +188,26 @@ object CarbonEnv {
       .addListener(classOf[AlterTableDropPartitionPostStatusEvent],
         AlterTableDropPartitionPostStatusListener)
       .addListener(classOf[AlterTableDropPartitionMetaEvent], AlterTableDropPartitionMetaListener)
-      .addListener(classOf[LoadTablePostExecutionEvent], new MergeIndexEventListener)
-      .addListener(classOf[AlterTableCompactionPostEvent], new MergeIndexEventListener)
+      .addListener(classOf[LoadTablePreStatusUpdateEvent], new MergeIndexEventListener)
+      .addListener(classOf[LoadTablePostExecutionEvent], LoadPostDataMapListener)
+      .addListener(classOf[UpdateTablePostEvent], LoadPostDataMapListener )
+      .addListener(classOf[DeleteFromTablePostEvent], LoadPostDataMapListener )
       .addListener(classOf[AlterTableMergeIndexEvent], new MergeIndexEventListener)
       .addListener(classOf[BuildDataMapPostExecutionEvent], new MergeBloomIndexEventListener)
+      .addListener(classOf[DropTableCacheEvent], DropCacheDataMapEventListener)
+      .addListener(classOf[DropTableCacheEvent], DropCacheBloomEventListener)
+      .addListener(classOf[ShowTableCacheEvent], ShowCachePreAggEventListener)
+      .addListener(classOf[ShowTableCacheEvent], ShowCacheDataMapEventListener)
+      .addListener(classOf[DeleteSegmentByIdPreEvent], DataMapDeleteSegmentPreListener)
+      .addListener(classOf[DeleteSegmentByDatePreEvent], DataMapDeleteSegmentPreListener)
+      .addListener(classOf[AlterTableDropColumnPreEvent], DataMapDropColumnPreListener)
+      .addListener(classOf[AlterTableColRenameAndDataTypeChangePreEvent],
+        DataMapChangeDataTypeorRenameColumnPreListener)
+      .addListener(classOf[AlterTableAddColumnPreEvent], DataMapAddColumnsPreListener)
+      .addListener(classOf[AlterTableDropPartitionMetaEvent],
+        DataMapAlterTableDropPartitionMetaListener)
+      .addListener(classOf[AlterTableDropPartitionPreStatusEvent],
+        DataMapAlterTableDropPartitionPreStatusListener)
   }
 
   /**
@@ -194,38 +217,35 @@ object CarbonEnv {
       databaseNameOp: Option[String],
       tableName: String)
     (sparkSession: SparkSession): CarbonTable = {
-    refreshRelationFromCache(TableIdentifier(tableName, databaseNameOp))(sparkSession)
-    val databaseName = getDatabaseName(databaseNameOp)(sparkSession)
     val catalog = getInstance(sparkSession).carbonMetaStore
-    // refresh cache
-    catalog.checkSchemasModifiedTimeAndReloadTable(TableIdentifier(tableName, databaseNameOp))
-
-    // try to get it from catch, otherwise lookup in catalog
-    catalog.getTableFromMetadataCache(databaseName, tableName)
-      .getOrElse(
-        catalog
-          .lookupRelation(databaseNameOp, tableName)(sparkSession)
-          .asInstanceOf[CarbonRelation]
-          .carbonTable)
+    // if relation is not refreshed of the table does not exist in cache then
+    if (isRefreshRequired(TableIdentifier(tableName, databaseNameOp))(sparkSession)) {
+      catalog
+        .lookupRelation(databaseNameOp, tableName)(sparkSession)
+        .asInstanceOf[CarbonRelation]
+        .carbonTable
+    } else {
+      CarbonMetadata.getInstance().getCarbonTable(databaseNameOp.getOrElse(sparkSession
+        .catalog.currentDatabase), tableName)
+    }
   }
 
-  def refreshRelationFromCache(identifier: TableIdentifier)(sparkSession: SparkSession): Boolean = {
-    var isRefreshed = false
+  /**
+   *
+   * @return true is the relation was changes and was removed from cache. false is there is no
+   *         change in the relation.
+   */
+  def isRefreshRequired(identifier: TableIdentifier)(sparkSession: SparkSession): Boolean = {
     val carbonEnv = getInstance(sparkSession)
-    val table = carbonEnv.carbonMetaStore.getTableFromMetadataCache(
-      identifier.database.getOrElse(sparkSession.sessionState.catalog.getCurrentDatabase),
-      identifier.table)
-    if (carbonEnv.carbonMetaStore
-          .checkSchemasModifiedTimeAndReloadTable(identifier)  && table.isDefined) {
-      sparkSession.sessionState.catalog.refreshTable(identifier)
-      val tablePath = table.get.getTablePath
-      DataMapStoreManager.getInstance().
-        clearDataMaps(AbsoluteTableIdentifier.from(tablePath,
+    val databaseName = identifier.database.getOrElse(sparkSession.catalog.currentDatabase)
+    val table = CarbonMetadata.getInstance().getCarbonTable(databaseName, identifier.table)
+    if (table == null) {
+      true
+    } else {
+      carbonEnv.carbonMetaStore.isSchemaRefreshed(AbsoluteTableIdentifier.from(table.getTablePath,
           identifier.database.getOrElse(sparkSession.sessionState.catalog.getCurrentDatabase),
-          identifier.table, table.get.getTableInfo.getFactTable.getTableId))
-      isRefreshed = true
+          identifier.table, table.getTableInfo.getFactTable.getTableId), sparkSession)
     }
-    isRefreshed
   }
 
   /**

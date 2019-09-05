@@ -16,16 +16,18 @@
  */
 package org.apache.spark.sql.hive
 
+import java.util.concurrent.Callable
+
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.{QualifiedTableName, TableIdentifier}
 import org.apache.spark.sql.catalyst.analysis.{Analyzer, FunctionRegistry}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.optimizer.Optimizer
 import org.apache.spark.sql.catalyst.parser.ParserInterface
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, SubqueryAlias}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.{FindDataSourceTable, PreWriteCheck, ResolveSQLOnFile, _}
 import org.apache.spark.sql.execution.strategy.{CarbonLateDecodeStrategy, DDLStrategy, StreamingTableStrategy}
@@ -34,7 +36,7 @@ import org.apache.spark.sql.internal.{SQLConf, SessionState}
 import org.apache.spark.sql.optimizer.{CarbonIUDRule, CarbonLateDecodeRule, CarbonUDFTransformRule}
 import org.apache.spark.sql.parser.CarbonSparkSqlParser
 
-import org.apache.carbondata.core.metadata.schema.table.column.{ColumnSchema => ColumnSchema}
+import org.apache.carbondata.core.metadata.schema.table.column.ColumnSchema
 import org.apache.carbondata.spark.util.CarbonScalaUtil
 
 /**
@@ -83,17 +85,24 @@ class CarbonHiveSessionCatalog(
   }
 
   // Initialize all listeners to the Operation bus.
-  CarbonEnv.initListeners()
+  CarbonEnv.init
 
   override def lookupRelation(name: TableIdentifier): LogicalPlan = {
-    val rtnRelation = super.lookupRelation(name)
+    var rtnRelation = super.lookupRelation(name)
     val isRelationRefreshed =
-      CarbonSessionUtil.refreshRelation(rtnRelation, name)(sparkSession)
+      CarbonSessionUtil.refreshRelationAndSetStats(rtnRelation, name)(sparkSession)
     if (isRelationRefreshed) {
-      super.lookupRelation(name)
-    } else {
-      rtnRelation
+      rtnRelation = super.lookupRelation(name)
+      // Reset the stats after lookup.
+      CarbonSessionUtil.refreshRelationAndSetStats(rtnRelation, name)(sparkSession)
     }
+    rtnRelation
+  }
+
+  override def getCachedPlan(t: QualifiedTableName,
+      c: Callable[LogicalPlan]): LogicalPlan = {
+    val plan = super.getCachedPlan(t, c)
+    CarbonSessionUtil.updateCachedPlan(plan)
   }
 
   /**
@@ -236,29 +245,33 @@ class CarbonSessionStateBuilder(sparkSession: SparkSession,
 
   override lazy val optimizer: Optimizer = new CarbonOptimizer(catalog, conf, experimentalMethods)
 
-  override protected def analyzer: Analyzer = new CarbonAnalyzer(catalog, conf, sparkSession,
+  override protected def analyzer: Analyzer = {
+    new CarbonAnalyzer(catalog,
+      conf,
+      sparkSession,
+      getAnalyzer(super.analyzer))
+  }
+
+  /**
+   * This method adds carbon rules to Hive Analyzer and returns new analyzer
+   * @param analyzer hiveSessionStateBuilder analyzer
+   * @return
+   */
+  def getAnalyzer(analyzer: Analyzer): Analyzer = {
     new Analyzer(catalog, conf) {
 
       override val extendedResolutionRules: Seq[Rule[LogicalPlan]] =
-        new ResolveHiveSerdeTable(session) +:
-        new FindDataSourceTable(session) +:
-        new ResolveSQLOnFile(session) +:
-        new CarbonIUDAnalysisRule(sparkSession) +:
-        new CarbonPreInsertionCasts(sparkSession) +: customResolutionRules
+        analyzer.extendedResolutionRules ++
+        Seq(CarbonIUDAnalysisRule(sparkSession)) ++
+        Seq(CarbonPreInsertionCasts(sparkSession)) ++ customResolutionRules
 
       override val extendedCheckRules: Seq[LogicalPlan => Unit] =
-      PreWriteCheck :: HiveOnlyCheck :: Nil
+        analyzer.extendedCheckRules
 
       override val postHocResolutionRules: Seq[Rule[LogicalPlan]] =
-        new DetermineTableStats(session) +:
-        RelationConversions(conf, catalog) +:
-        PreprocessTableCreation(session) +:
-        PreprocessTableInsertion(conf) +:
-        DataSourceAnalysis(conf) +:
-        HiveAnalysis +:
-        customPostHocResolutionRules
+        analyzer.postHocResolutionRules
     }
-  )
+  }
 
   override protected def newBuilder: NewBuilder = new CarbonSessionStateBuilder(_, _)
 }

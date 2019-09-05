@@ -34,12 +34,12 @@ import org.apache.spark.util.AlterTableUtil
 import org.apache.carbondata.common.exceptions.sql.MalformedCarbonCommandException
 import org.apache.carbondata.common.logging.LogServiceFactory
 import org.apache.carbondata.core.constants.CarbonCommonConstants
+import org.apache.carbondata.core.datamap.status.DataMapStatusManager
 import org.apache.carbondata.core.datastore.compression.CompressorFactory
 import org.apache.carbondata.core.datastore.impl.FileFactory
 import org.apache.carbondata.core.exception.ConcurrentOperationException
 import org.apache.carbondata.core.locks.{CarbonLockFactory, LockUsage}
 import org.apache.carbondata.core.metadata.ColumnarFormatVersion
-import org.apache.carbondata.core.metadata.datatype.DataTypes
 import org.apache.carbondata.core.metadata.schema.table.{CarbonTable, TableInfo}
 import org.apache.carbondata.core.mutate.CarbonUpdateUtil
 import org.apache.carbondata.core.statusmanager.SegmentStatusManager
@@ -50,6 +50,7 @@ import org.apache.carbondata.events._
 import org.apache.carbondata.processing.loading.events.LoadEvents.LoadMetadataEvent
 import org.apache.carbondata.processing.loading.model.{CarbonDataLoadSchema, CarbonLoadModel}
 import org.apache.carbondata.processing.merger.{CarbonDataMergerUtil, CompactionType}
+import org.apache.carbondata.processing.util.CarbonLoaderUtil
 import org.apache.carbondata.spark.rdd.{CarbonDataRDDFactory, StreamHandoffRDD}
 import org.apache.carbondata.streaming.segment.StreamSegment
 
@@ -116,7 +117,34 @@ case class CarbonAlterTableCompactionCommand(
         throw new MalformedCarbonCommandException(
           "Unsupported alter operation on carbon table")
     }
-    if (compactionType == CompactionType.SEGMENT_INDEX) {
+    if (compactionType == CompactionType.UPGRADE_SEGMENT) {
+      val tableStatusLock = CarbonLockFactory
+        .getCarbonLockObj(table.getAbsoluteTableIdentifier, LockUsage.TABLE_STATUS_LOCK)
+      try {
+        if (tableStatusLock.lockWithRetries()) {
+          val loadMetaDataDetails = SegmentStatusManager.readTableStatusFile(CarbonTablePath
+            .getTableStatusFilePath(table.getTablePath))
+          loadMetaDataDetails.foreach { loadMetaDataDetail =>
+            // "0" check is added to reproduce a scenario similar to 1.1 store where the size
+            // would be null. For test case in the new version it would be set to 0.
+            if (loadMetaDataDetail.getIndexSize == null || loadMetaDataDetail.getDataSize == null
+            || loadMetaDataDetail.getIndexSize == "0" || loadMetaDataDetail.getDataSize == "0") {
+              CarbonLoaderUtil
+                .addDataIndexSizeIntoMetaEntry(loadMetaDataDetail, loadMetaDataDetail.getLoadName,
+                  table)
+            }
+          }
+          SegmentStatusManager.writeLoadDetailsIntoFile(CarbonTablePath
+            .getTableStatusFilePath(table.getTablePath), loadMetaDataDetails)
+        } else {
+          throw new ConcurrentOperationException(table.getDatabaseName,
+            table.getTableName, "table status updation", "upgrade segments")
+        }
+      } finally {
+        tableStatusLock.unlock()
+      }
+      Seq.empty
+    } else if (compactionType == CompactionType.SEGMENT_INDEX) {
       if (table.isStreamingSink) {
         throw new MalformedCarbonCommandException(
           "Unsupported alter operation on carbon table: Merge index is not supported on streaming" +
@@ -288,31 +316,46 @@ case class CarbonAlterTableCompactionCommand(
       val lock = CarbonLockFactory.getCarbonLockObj(
         carbonTable.getAbsoluteTableIdentifier,
         LockUsage.COMPACTION_LOCK)
-
-      if (lock.lockWithRetries()) {
-        LOGGER.info("Acquired the compaction lock for table" +
-                    s" ${ carbonLoadModel.getDatabaseName }.${ carbonLoadModel.getTableName }")
-        try {
-          CarbonDataRDDFactory.startCompactionThreads(
-            sqlContext,
-            carbonLoadModel,
-            storeLocation,
-            compactionModel,
-            lock,
-            compactedSegments,
-            operationContext
-          )
-        } catch {
-          case e: Exception =>
-            LOGGER.error(s"Exception in start compaction thread. ${ e.getMessage }")
-            lock.unlock()
-            throw e
+      val updateLock = CarbonLockFactory.getCarbonLockObj(carbonTable
+        .getAbsoluteTableIdentifier, LockUsage.UPDATE_LOCK)
+      try {
+        // COMPACTION_LOCK and UPDATE_LOCK are already locked when start to execute update sql,
+        // so it don't need to require locks again when compactionType is IUD_UPDDEL_DELTA.
+        if (CompactionType.IUD_UPDDEL_DELTA != compactionType) {
+          if (!updateLock.lockWithRetries(3, 3)) {
+            throw new ConcurrentOperationException(carbonTable, "update", "compaction")
+          }
+          if (!lock.lockWithRetries()) {
+            LOGGER.error(s"Not able to acquire the compaction lock for table " +
+                         s"${ carbonLoadModel.getDatabaseName }.${ carbonLoadModel.getTableName }")
+            CarbonException.analysisException(
+              "Table is already locked for compaction. Please try after some time.")
+          } else {
+            LOGGER.info("Acquired the compaction lock for table " +
+                        s"${ carbonLoadModel.getDatabaseName }.${ carbonLoadModel.getTableName }")
+          }
         }
-      } else {
-        LOGGER.error(s"Not able to acquire the compaction lock for table" +
-                     s" ${ carbonLoadModel.getDatabaseName }.${ carbonLoadModel.getTableName }")
-        CarbonException.analysisException(
-          "Table is already locked for compaction. Please try after some time.")
+        CarbonDataRDDFactory.startCompactionThreads(
+          sqlContext,
+          carbonLoadModel,
+          storeLocation,
+          compactionModel,
+          lock,
+          compactedSegments,
+          operationContext
+        )
+      } catch {
+        case e: Exception =>
+          LOGGER.error(s"Exception in start compaction thread.", e)
+          if (CompactionType.IUD_UPDDEL_DELTA != compactionType) {
+            lock.unlock()
+          }
+          throw e
+      } finally {
+        if (CompactionType.IUD_UPDDEL_DELTA != compactionType) {
+          updateLock.unlock()
+        }
+        DataMapStatusManager.disableAllLazyDataMaps(carbonTable)
       }
     }
   }

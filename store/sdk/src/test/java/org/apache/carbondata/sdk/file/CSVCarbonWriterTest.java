@@ -33,6 +33,7 @@ import org.apache.carbondata.core.datastore.filesystem.CarbonFile;
 import org.apache.carbondata.core.datastore.impl.FileFactory;
 import org.apache.carbondata.core.metadata.AbsoluteTableIdentifier;
 import org.apache.carbondata.core.metadata.datatype.DataTypes;
+import org.apache.carbondata.core.metadata.datatype.DecimalType;
 import org.apache.carbondata.core.metadata.datatype.StructField;
 import org.apache.carbondata.core.metadata.schema.SchemaReader;
 import org.apache.carbondata.core.metadata.schema.table.TableInfo;
@@ -107,6 +108,71 @@ public class CSVCarbonWriterTest {
   }
 
   @Test
+  public void testWriteJsonSchemaWithDefaultDecimal() {
+    String jsonSchema = new StringBuilder()
+        .append("[ \n")
+        .append("   {\"name\":\"string\"},\n")
+        .append("   {\"age\":\"int\"},\n")
+        .append("   {\"height\":\"double\"},\n")
+        .append("   {\"decimalField\":\"decimal\"}\n")
+        .append("]")
+        .toString();
+    Schema schema = Schema.parseJson(jsonSchema);
+    assert (10 == ((DecimalType) schema.getFields()[3].getDataType()).getPrecision());
+    assert (2 == ((DecimalType) schema.getFields()[3].getDataType()).getScale());
+  }
+
+  @Test
+  public void testWriteJsonSchemaWithCustomDecimal() {
+    String jsonSchema = new StringBuilder()
+        .append("[ \n")
+        .append("   {\"name\":\"string\"},\n")
+        .append("   {\"age\":\"int\"},\n")
+        .append("   {\"height\":\"double\"},\n")
+        .append("   {\"decimalField\":\"decimal(17,3)\"}\n")
+        .append("]")
+        .toString();
+    Schema schema = Schema.parseJson(jsonSchema);
+    assert (17 == ((DecimalType) schema.getFields()[3].getDataType()).getPrecision());
+    assert (3 == ((DecimalType) schema.getFields()[3].getDataType()).getScale());
+  }
+
+  @Test
+  public void testWriteJsonSchemaWithCustomDecimalAndSpace() {
+    String jsonSchema = new StringBuilder()
+        .append("[ \n")
+        .append("   {\"name\":\"string\"},\n")
+        .append("   {\"age\":\"int\"},\n")
+        .append("   {\"height\":\"double\"},\n")
+        .append("   {\"decimalField\":\"decimal( 17, 3)\"}\n")
+        .append("]")
+        .toString();
+    Schema schema = Schema.parseJson(jsonSchema);
+    assert (17 == ((DecimalType) schema.getFields()[3].getDataType()).getPrecision());
+    assert (3 == ((DecimalType) schema.getFields()[3].getDataType()).getScale());
+  }
+
+  @Test
+  public void testWriteJsonSchemaWithImproperDecimal() {
+    String jsonSchema = new StringBuilder()
+        .append("[ \n")
+        .append("   {\"name\":\"string\"},\n")
+        .append("   {\"age\":\"int\"},\n")
+        .append("   {\"height\":\"double\"},\n")
+        .append("   {\"decimalField\":\"decimal( 17, )\"}\n")
+        .append("]")
+        .toString();
+    try {
+      Schema.parseJson(jsonSchema);
+      assert (false);
+    } catch (Exception e) {
+      assert (e.getMessage().contains("unsupported data type: decimal( 17, ). " +
+          "Please use decimal or decimal(precision,scale), " +
+          "precision can be 10 and scale can be 2"));
+    }
+  }
+
+  @Test
   public void testWriteFilesBuildWithJsonSchema() throws IOException, InvalidLoadOptionException, InterruptedException {
     String path = "./testWriteFilesJsonSchema";
     FileUtils.deleteDirectory(new File(path));
@@ -139,7 +205,6 @@ public class CSVCarbonWriterTest {
 
   @Test
   public void testAllPrimitiveDataType() throws IOException {
-    // TODO: write all data type and read by CarbonRecordReader to verify the content
     String path = "./testWriteFiles";
     FileUtils.deleteDirectory(new File(path));
 
@@ -159,15 +224,16 @@ public class CSVCarbonWriterTest {
       CarbonWriter writer = builder.withCsvInput(new Schema(fields)).writtenBy("CSVCarbonWriterTest").build();
 
       for (int i = 0; i < 100; i++) {
-        String[] row = new String[]{
+        Object[] row = new Object[]{
             "robot" + (i % 10),
-            String.valueOf(i),
-            String.valueOf(i),
-            String.valueOf(Long.MAX_VALUE - i),
-            String.valueOf((double) i / 2),
-            String.valueOf(true),
+            i,
+            i,
+            (Long.MAX_VALUE - i),
+            ((double) i / 2),
+            true,
             "2019-03-02",
-            "2019-02-12 03:03:34"
+            "2019-02-12 03:03:34",
+            "1.234567"
         };
         writer.write(row);
       }
@@ -322,8 +388,8 @@ public class CSVCarbonWriterTest {
       Assert.assertNotNull(dataFiles);
       Assert.assertTrue(dataFiles.length > 0);
       String taskNo = CarbonTablePath.DataFileUtil.getTaskNo(dataFiles[0].getName());
-      long taskID = CarbonTablePath.DataFileUtil.getTaskIdFromTaskNo(taskNo);
-      Assert.assertEquals("Task Id is not matched", taskID, 5);
+      String taskID = CarbonTablePath.DataFileUtil.getTaskIdFromTaskNo(taskNo);
+      Assert.assertEquals("Task Id is not matched", taskID, "5");
     } catch (Exception e) {
       e.printStackTrace();
       Assert.fail(e.getMessage());

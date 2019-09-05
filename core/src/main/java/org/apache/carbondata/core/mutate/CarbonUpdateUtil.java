@@ -28,6 +28,7 @@ import java.util.Set;
 
 import org.apache.carbondata.common.logging.LogServiceFactory;
 import org.apache.carbondata.core.constants.CarbonCommonConstants;
+import org.apache.carbondata.core.constants.CarbonCommonConstantsInternal;
 import org.apache.carbondata.core.datamap.Segment;
 import org.apache.carbondata.core.datastore.filesystem.CarbonFile;
 import org.apache.carbondata.core.datastore.filesystem.CarbonFileFilter;
@@ -465,94 +466,96 @@ public class CarbonUpdateUtil {
       if (segment.getSegmentStatus() == SegmentStatus.SUCCESS
               || segment.getSegmentStatus() == SegmentStatus.LOAD_PARTIAL_SUCCESS) {
 
-        // take the list of files from this segment.
-        String segmentPath = CarbonTablePath.getSegmentPath(
-            table.getAbsoluteTableIdentifier().getTablePath(), segment.getLoadName());
-        CarbonFile segDir =
-            FileFactory.getCarbonFile(segmentPath, FileFactory.getFileType(segmentPath));
-        CarbonFile[] allSegmentFiles = segDir.listFiles();
+        // when there is no update operations done on table, then no need to go ahead. So
+        // just check the update delta start timestamp and proceed if not empty
+        if (!segment.getUpdateDeltaStartTimestamp().isEmpty()) {
+          // take the list of files from this segment.
+          String segmentPath = CarbonTablePath.getSegmentPath(
+              table.getAbsoluteTableIdentifier().getTablePath(), segment.getLoadName());
+          CarbonFile segDir =
+              FileFactory.getCarbonFile(segmentPath, FileFactory.getFileType(segmentPath));
+          CarbonFile[] allSegmentFiles = segDir.listFiles();
 
-        // scan through the segment and find the carbondatafiles and index files.
-        SegmentUpdateStatusManager updateStatusManager = new SegmentUpdateStatusManager(table);
+          // scan through the segment and find the carbondatafiles and index files.
+          SegmentUpdateStatusManager updateStatusManager = new SegmentUpdateStatusManager(table);
 
-        boolean updateSegmentFile = false;
-        // deleting of the aborted file scenario.
-        if (deleteStaleCarbonDataFiles(segment, allSegmentFiles, updateStatusManager)) {
-          updateSegmentFile = true;
-        }
-
-        // get Invalid update  delta files.
-        CarbonFile[] invalidUpdateDeltaFiles = updateStatusManager
-            .getUpdateDeltaFilesList(segment.getLoadName(), false,
-                CarbonCommonConstants.UPDATE_DELTA_FILE_EXT, true, allSegmentFiles,
-                isInvalidFile);
-
-        // now for each invalid delta file need to check the query execution time out
-        // and then delete.
-        for (CarbonFile invalidFile : invalidUpdateDeltaFiles) {
-          compareTimestampsAndDelete(invalidFile, forceDelete, false);
-        }
-        // do the same for the index files.
-        CarbonFile[] invalidIndexFiles = updateStatusManager
-            .getUpdateDeltaFilesList(segment.getLoadName(), false,
-                CarbonCommonConstants.UPDATE_INDEX_FILE_EXT, true, allSegmentFiles,
-                isInvalidFile);
-
-        // now for each invalid index file need to check the query execution time out
-        // and then delete.
-
-        for (CarbonFile invalidFile : invalidIndexFiles) {
-          if (compareTimestampsAndDelete(invalidFile, forceDelete, false)) {
+          boolean updateSegmentFile = false;
+          // deleting of the aborted file scenario.
+          if (deleteStaleCarbonDataFiles(segment, allSegmentFiles, updateStatusManager)) {
             updateSegmentFile = true;
           }
-        }
-        // now handle all the delete delta files which needs to be deleted.
-        // there are 2 cases here .
-        // 1. if the block is marked as compacted then the corresponding delta files
-        //    can be deleted if query exec timeout is done.
-        // 2. if the block is in success state then also there can be delete
-        //    delta compaction happened and old files can be deleted.
 
-        SegmentUpdateDetails[] updateDetails = updateStatusManager.readLoadMetadata();
-        for (SegmentUpdateDetails block : updateDetails) {
-          CarbonFile[] completeListOfDeleteDeltaFiles;
-          CarbonFile[] invalidDeleteDeltaFiles;
+          // get Invalid update  delta files.
+          CarbonFile[] invalidUpdateDeltaFiles = updateStatusManager
+              .getUpdateDeltaFilesList(segment, false,
+                  CarbonCommonConstants.UPDATE_DELTA_FILE_EXT, true, allSegmentFiles,
+                  isInvalidFile);
 
-          if (!block.getSegmentName().equalsIgnoreCase(segment.getLoadName())) {
-            continue;
+          // now for each invalid delta file need to check the query execution time out
+          // and then delete.
+          for (CarbonFile invalidFile : invalidUpdateDeltaFiles) {
+            compareTimestampsAndDelete(invalidFile, forceDelete, false);
           }
+          // do the same for the index files.
+          CarbonFile[] invalidIndexFiles = updateStatusManager
+              .getUpdateDeltaFilesList(segment, false,
+                  CarbonCommonConstants.UPDATE_INDEX_FILE_EXT, true, allSegmentFiles,
+                  isInvalidFile);
 
-          // aborted scenario.
-          invalidDeleteDeltaFiles = updateStatusManager
-              .getDeleteDeltaInvalidFilesList(block, false,
-                  allSegmentFiles, isAbortedFile);
-          for (CarbonFile invalidFile : invalidDeleteDeltaFiles) {
-            boolean doForceDelete = true;
-            compareTimestampsAndDelete(invalidFile, doForceDelete, false);
+          // now for each invalid index file need to check the query execution time out
+          // and then delete.
+
+          for (CarbonFile invalidFile : invalidIndexFiles) {
+            if (compareTimestampsAndDelete(invalidFile, forceDelete, false)) {
+              updateSegmentFile = true;
+            }
           }
+          // now handle all the delete delta files which needs to be deleted.
+          // there are 2 cases here .
+          // 1. if the block is marked as compacted then the corresponding delta files
+          //    can be deleted if query exec timeout is done.
+          // 2. if the block is in success state then also there can be delete
+          //    delta compaction happened and old files can be deleted.
 
-          // case 1
-          if (CarbonUpdateUtil.isBlockInvalid(block.getSegmentStatus())) {
-            completeListOfDeleteDeltaFiles = updateStatusManager
-                    .getDeleteDeltaInvalidFilesList(block, true,
-                            allSegmentFiles, isInvalidFile);
-            for (CarbonFile invalidFile : completeListOfDeleteDeltaFiles) {
+          SegmentUpdateDetails[] updateDetails = updateStatusManager.readLoadMetadata();
+          for (SegmentUpdateDetails block : updateDetails) {
+            CarbonFile[] completeListOfDeleteDeltaFiles;
+            CarbonFile[] invalidDeleteDeltaFiles;
 
-              compareTimestampsAndDelete(invalidFile, forceDelete, false);
+            if (!block.getSegmentName().equalsIgnoreCase(segment.getLoadName())) {
+              continue;
             }
 
-          } else {
+            // aborted scenario.
             invalidDeleteDeltaFiles = updateStatusManager
-                    .getDeleteDeltaInvalidFilesList(block, false,
-                            allSegmentFiles, isInvalidFile);
+                .getDeleteDeltaInvalidFilesList(block, false,
+                    allSegmentFiles, isAbortedFile);
             for (CarbonFile invalidFile : invalidDeleteDeltaFiles) {
+              boolean doForceDelete = true;
+              compareTimestampsAndDelete(invalidFile, doForceDelete, false);
+            }
 
-              compareTimestampsAndDelete(invalidFile, forceDelete, false);
+            // case 1
+            if (CarbonUpdateUtil.isBlockInvalid(block.getSegmentStatus())) {
+              completeListOfDeleteDeltaFiles = updateStatusManager
+                  .getDeleteDeltaInvalidFilesList(block, true,
+                      allSegmentFiles, isInvalidFile);
+              for (CarbonFile invalidFile : completeListOfDeleteDeltaFiles) {
+                compareTimestampsAndDelete(invalidFile, forceDelete, false);
+              }
+
+            } else {
+              invalidDeleteDeltaFiles = updateStatusManager
+                  .getDeleteDeltaInvalidFilesList(block, false,
+                      allSegmentFiles, isInvalidFile);
+              for (CarbonFile invalidFile : invalidDeleteDeltaFiles) {
+                compareTimestampsAndDelete(invalidFile, forceDelete, false);
+              }
             }
           }
-        }
-        if (updateSegmentFile) {
-          segmentFilesToBeUpdated.add(Segment.toSegment(segment.getLoadName(), null));
+          if (updateSegmentFile) {
+            segmentFilesToBeUpdated.add(Segment.toSegment(segment.getLoadName(), null));
+          }
         }
       }
     }
@@ -615,7 +618,7 @@ public class CarbonUpdateUtil {
   private static boolean deleteStaleCarbonDataFiles(LoadMetadataDetails segment,
       CarbonFile[] allSegmentFiles, SegmentUpdateStatusManager updateStatusManager) {
     CarbonFile[] invalidUpdateDeltaFiles = updateStatusManager
-        .getUpdateDeltaFilesList(segment.getLoadName(), false,
+        .getUpdateDeltaFilesList(segment, false,
             CarbonCommonConstants.UPDATE_DELTA_FILE_EXT, true, allSegmentFiles,
             true);
     // now for each invalid delta file need to check the query execution time out
@@ -625,7 +628,7 @@ public class CarbonUpdateUtil {
     }
     // do the same for the index files.
     CarbonFile[] invalidIndexFiles = updateStatusManager
-        .getUpdateDeltaFilesList(segment.getLoadName(), false,
+        .getUpdateDeltaFilesList(segment, false,
             CarbonCommonConstants.UPDATE_INDEX_FILE_EXT, true, allSegmentFiles,
             true);
     // now for each invalid index file need to check the query execution time out
@@ -672,7 +675,8 @@ public class CarbonUpdateUtil {
   private static boolean compareTimestampsAndDelete(
       CarbonFile invalidFile,
       boolean forceDelete, boolean isUpdateStatusFile) {
-    long fileTimestamp = 0L;
+    boolean isDeleted = false;
+    Long fileTimestamp;
 
     if (isUpdateStatusFile) {
       fileTimestamp = CarbonUpdateUtil.getTimeStampAsLong(invalidFile.getName()
@@ -682,21 +686,40 @@ public class CarbonUpdateUtil {
               CarbonTablePath.DataFileUtil.getTimeStampFromFileName(invalidFile.getName()));
     }
 
-    // if the timestamp of the file is more than the current time by query execution timeout.
-    // then delete that file.
-    if (CarbonUpdateUtil.isMaxQueryTimeoutExceeded(fileTimestamp) || forceDelete) {
-      // delete the files.
-      try {
-        LOGGER.info("deleting the invalid file : " + invalidFile.getName());
-        CarbonUtil.deleteFoldersAndFiles(invalidFile);
-        return true;
-      } catch (IOException e) {
-        LOGGER.error("error in clean up of compacted files." + e.getMessage(), e);
-      } catch (InterruptedException e) {
-        LOGGER.error("error in clean up of compacted files." + e.getMessage(), e);
+    // This check is because, when there are some invalid files like tableStatusUpdate.write files
+    // present in store [[which can happen during delete or update if the disk is full or hdfs quota
+    // is finished]] then fileTimestamp will be null, in that case check for max query out and
+    // delete the .write file after timeout
+    if (fileTimestamp == null) {
+      String tableUpdateStatusFilename = invalidFile.getName();
+      if (tableUpdateStatusFilename.endsWith(".write")) {
+        long tableUpdateStatusFileTimeStamp = Long.parseLong(
+            CarbonTablePath.DataFileUtil.getTimeStampFromFileName(tableUpdateStatusFilename));
+        if (isMaxQueryTimeoutExceeded(tableUpdateStatusFileTimeStamp)) {
+          isDeleted = deleteInvalidFiles(invalidFile);
+        }
+      }
+    } else {
+      // if the timestamp of the file is more than the current time by query execution timeout.
+      // then delete that file.
+      if (CarbonUpdateUtil.isMaxQueryTimeoutExceeded(fileTimestamp) || forceDelete) {
+        isDeleted = deleteInvalidFiles(invalidFile);
       }
     }
-    return false;
+    return isDeleted;
+  }
+
+  private static boolean deleteInvalidFiles(CarbonFile invalidFile) {
+    boolean isDeleted;
+    try {
+      LOGGER.info("deleting the invalid file : " + invalidFile.getName());
+      CarbonUtil.deleteFoldersAndFiles(invalidFile);
+      isDeleted = true;
+    } catch (IOException | InterruptedException e) {
+      LOGGER.error("error in clean up of invalid files." + e.getMessage(), e);
+      isDeleted = false;
+    }
+    return isDeleted;
   }
 
   public static boolean isBlockInvalid(SegmentStatus blockStatus) {
@@ -747,9 +770,12 @@ public class CarbonUpdateUtil {
   /**
    * Return row count of input block
    */
-  public static long getRowCount(
-      BlockMappingVO blockMappingVO,
-      CarbonTable carbonTable) {
+  public static long getRowCount(BlockMappingVO blockMappingVO, CarbonTable carbonTable) {
+    if (blockMappingVO.getBlockRowCountMapping().size() == 1
+        && blockMappingVO.getBlockRowCountMapping().get(CarbonCommonConstantsInternal.ROW_COUNT)
+        != null) {
+      return blockMappingVO.getBlockRowCountMapping().get(CarbonCommonConstantsInternal.ROW_COUNT);
+    }
     SegmentUpdateStatusManager updateStatusManager =
         new SegmentUpdateStatusManager(carbonTable);
     long rowCount = 0;

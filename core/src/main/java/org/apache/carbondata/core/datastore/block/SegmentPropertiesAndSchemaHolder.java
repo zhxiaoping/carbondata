@@ -98,7 +98,7 @@ public class SegmentPropertiesAndSchemaHolder {
    * @param columnCardinality
    * @param segmentId
    */
-  public int addSegmentProperties(CarbonTable carbonTable,
+  public SegmentPropertiesWrapper addSegmentProperties(CarbonTable carbonTable,
       List<ColumnSchema> columnsInTable, int[] columnCardinality, String segmentId) {
     SegmentPropertiesAndSchemaHolder.SegmentPropertiesWrapper segmentPropertiesWrapper =
         new SegmentPropertiesAndSchemaHolder.SegmentPropertiesWrapper(carbonTable,
@@ -137,7 +137,7 @@ public class SegmentPropertiesAndSchemaHolder {
             .addMinMaxColumns(carbonTable);
       }
     }
-    return segmentIdSetAndIndexWrapper.getSegmentPropertiesIndex();
+    return getSegmentPropertiesWrapper(segmentIdSetAndIndexWrapper.getSegmentPropertiesIndex());
   }
 
   /**
@@ -222,33 +222,32 @@ public class SegmentPropertiesAndSchemaHolder {
    * Method to remove the given segment ID
    *
    * @param segmentId
-   * @param segmentPropertiesIndex
    * @param clearSegmentWrapperFromMap flag to specify whether to clear segmentPropertiesWrapper
    *                                   from Map if all the segment's using it have become stale
    */
-  public void invalidate(String segmentId, int segmentPropertiesIndex,
+  public void invalidate(String segmentId, SegmentPropertiesWrapper segmentPropertiesWrapper,
       boolean clearSegmentWrapperFromMap) {
-    SegmentPropertiesWrapper segmentPropertiesWrapper =
-        indexToSegmentPropertiesWrapperMapping.get(segmentPropertiesIndex);
-    if (null != segmentPropertiesWrapper) {
-      SegmentIdAndSegmentPropertiesIndexWrapper segmentIdAndSegmentPropertiesIndexWrapper =
-          segmentPropWrapperToSegmentSetMap.get(segmentPropertiesWrapper);
+    SegmentIdAndSegmentPropertiesIndexWrapper segmentIdAndSegmentPropertiesIndexWrapper =
+        segmentPropWrapperToSegmentSetMap.get(segmentPropertiesWrapper);
+    if (segmentIdAndSegmentPropertiesIndexWrapper != null) {
       synchronized (getOrCreateTableLock(segmentPropertiesWrapper.getTableIdentifier())) {
         segmentIdAndSegmentPropertiesIndexWrapper.removeSegmentId(segmentId);
-      }
-      // if after removal of given SegmentId, the segmentIdSet becomes empty that means this
-      // segmentPropertiesWrapper is not getting used at all. In that case this object can be
-      // removed from all the holders
-      if (clearSegmentWrapperFromMap && segmentIdAndSegmentPropertiesIndexWrapper.segmentIdSet
-          .isEmpty()) {
-        indexToSegmentPropertiesWrapperMapping.remove(segmentPropertiesIndex);
-        segmentPropWrapperToSegmentSetMap.remove(segmentPropertiesWrapper);
-      } else if (!clearSegmentWrapperFromMap
-          && segmentIdAndSegmentPropertiesIndexWrapper.segmentIdSet.isEmpty()) {
-        // min max columns can very when cache is modified. So even though entry is not required
-        // to be deleted from map clear the column cache so that it can filled again
-        segmentPropertiesWrapper.clear();
-        LOGGER.info("cleared min max for segmentProperties at index: " + segmentPropertiesIndex);
+        // if after removal of given SegmentId, the segmentIdSet becomes empty that means this
+        // segmentPropertiesWrapper is not getting used at all. In that case this object can be
+        // removed from all the holders
+        if (clearSegmentWrapperFromMap && segmentIdAndSegmentPropertiesIndexWrapper.segmentIdSet
+            .isEmpty()) {
+          indexToSegmentPropertiesWrapperMapping
+              .remove(segmentIdAndSegmentPropertiesIndexWrapper.getSegmentPropertiesIndex());
+          segmentPropWrapperToSegmentSetMap.remove(segmentPropertiesWrapper);
+        } else if (!clearSegmentWrapperFromMap
+            && segmentIdAndSegmentPropertiesIndexWrapper.segmentIdSet.isEmpty()) {
+          // min max columns can very when cache is modified. So even though entry is not required
+          // to be deleted from map clear the column cache so that it can filled again
+          segmentPropertiesWrapper.clear();
+          LOGGER.info("cleared min max for segmentProperties at index: "
+              + segmentIdAndSegmentPropertiesIndexWrapper.getSegmentPropertiesIndex());
+        }
       }
     }
   }
@@ -280,12 +279,13 @@ public class SegmentPropertiesAndSchemaHolder {
 
     private static final Object taskSchemaLock = new Object();
     private static final Object fileFooterSchemaLock = new Object();
+    private static final Object minMaxLock = new Object();
 
-    private AbsoluteTableIdentifier tableIdentifier;
     private List<ColumnSchema> columnsInTable;
     private int[] columnCardinality;
     private SegmentProperties segmentProperties;
     private List<CarbonColumn> minMaxCacheColumns;
+    private CarbonTable carbonTable;
     // in case of hybrid store we can have block as well as blocklet schema
     // Scenario: When there is a hybrid store in which few loads are from legacy store which do
     // not contain the blocklet information and hence they will be, by default have cache_level as
@@ -300,7 +300,7 @@ public class SegmentPropertiesAndSchemaHolder {
 
     public SegmentPropertiesWrapper(CarbonTable carbonTable,
         List<ColumnSchema> columnsInTable, int[] columnCardinality) {
-      this.tableIdentifier = carbonTable.getAbsoluteTableIdentifier();
+      this.carbonTable = carbonTable;
       this.columnsInTable = columnsInTable;
       this.columnCardinality = columnCardinality;
     }
@@ -320,8 +320,9 @@ public class SegmentPropertiesAndSchemaHolder {
      */
     public void clear() {
       if (null != minMaxCacheColumns) {
-        minMaxCacheColumns.clear();
+        minMaxCacheColumns = null;
       }
+
       taskSummarySchemaForBlock = null;
       taskSummarySchemaForBlocklet = null;
       fileFooterEntrySchemaForBlock = null;
@@ -334,7 +335,8 @@ public class SegmentPropertiesAndSchemaHolder {
       }
       SegmentPropertiesAndSchemaHolder.SegmentPropertiesWrapper other =
           (SegmentPropertiesAndSchemaHolder.SegmentPropertiesWrapper) obj;
-      return tableIdentifier.equals(other.tableIdentifier) && checkColumnSchemaEquality(
+      return carbonTable.getAbsoluteTableIdentifier()
+          .equals(other.carbonTable.getAbsoluteTableIdentifier()) && checkColumnSchemaEquality(
           columnsInTable, other.columnsInTable) && Arrays
           .equals(columnCardinality, other.columnCardinality);
     }
@@ -343,15 +345,9 @@ public class SegmentPropertiesAndSchemaHolder {
       if (obj1 == null || obj2 == null || (obj1.size() != obj2.size())) {
         return false;
       }
-      List<ColumnSchema> clonedObj1 = new ArrayList<>(obj1);
-      List<ColumnSchema> clonedObj2 = new ArrayList<>(obj2);
-      clonedObj1.addAll(obj1);
-      clonedObj2.addAll(obj2);
-      sortList(clonedObj1);
-      sortList(clonedObj2);
       boolean exists = true;
       for (int i = 0; i < obj1.size(); i++) {
-        if (!clonedObj1.get(i).equalsWithStrictCheck(clonedObj2.get(i))) {
+        if (!obj1.get(i).equalsWithStrictCheck(obj2.get(i))) {
           exists = false;
           break;
         }
@@ -369,15 +365,18 @@ public class SegmentPropertiesAndSchemaHolder {
 
     @Override public int hashCode() {
       int allColumnsHashCode = 0;
+      // check column order
+      StringBuilder builder = new StringBuilder();
       for (ColumnSchema columnSchema: columnsInTable) {
         allColumnsHashCode = allColumnsHashCode + columnSchema.strictHashCode();
+        builder.append(columnSchema.getColumnUniqueId()).append(",");
       }
-      return tableIdentifier.hashCode() + allColumnsHashCode + Arrays
-          .hashCode(columnCardinality);
+      return carbonTable.getAbsoluteTableIdentifier().hashCode() + allColumnsHashCode + Arrays
+          .hashCode(columnCardinality) + builder.toString().hashCode();
     }
 
     public AbsoluteTableIdentifier getTableIdentifier() {
-      return tableIdentifier;
+      return carbonTable.getAbsoluteTableIdentifier();
     }
 
     public SegmentProperties getSegmentProperties() {
@@ -398,8 +397,8 @@ public class SegmentPropertiesAndSchemaHolder {
         synchronized (taskSchemaLock) {
           if (null == taskSummarySchemaForBlock) {
             taskSummarySchemaForBlock = SchemaGenerator
-                .createTaskSummarySchema(segmentProperties, minMaxCacheColumns, storeBlockletCount,
-                    filePathToBeStored);
+                .createTaskSummarySchema(segmentProperties, getMinMaxCacheColumns(),
+                    storeBlockletCount, filePathToBeStored);
           }
         }
       }
@@ -412,8 +411,8 @@ public class SegmentPropertiesAndSchemaHolder {
         synchronized (taskSchemaLock) {
           if (null == taskSummarySchemaForBlocklet) {
             taskSummarySchemaForBlocklet = SchemaGenerator
-                .createTaskSummarySchema(segmentProperties, minMaxCacheColumns, storeBlockletCount,
-                    filePathToBeStored);
+                .createTaskSummarySchema(segmentProperties, getMinMaxCacheColumns(),
+                    storeBlockletCount, filePathToBeStored);
           }
         }
       }
@@ -425,7 +424,7 @@ public class SegmentPropertiesAndSchemaHolder {
         synchronized (fileFooterSchemaLock) {
           if (null == fileFooterEntrySchemaForBlock) {
             fileFooterEntrySchemaForBlock =
-                SchemaGenerator.createBlockSchema(segmentProperties, minMaxCacheColumns);
+                SchemaGenerator.createBlockSchema(segmentProperties, getMinMaxCacheColumns());
           }
         }
       }
@@ -437,7 +436,7 @@ public class SegmentPropertiesAndSchemaHolder {
         synchronized (fileFooterSchemaLock) {
           if (null == fileFooterEntrySchemaForBlocklet) {
             fileFooterEntrySchemaForBlocklet =
-                SchemaGenerator.createBlockletSchema(segmentProperties, minMaxCacheColumns);
+                SchemaGenerator.createBlockletSchema(segmentProperties, getMinMaxCacheColumns());
           }
         }
       }
@@ -445,6 +444,13 @@ public class SegmentPropertiesAndSchemaHolder {
     }
 
     public List<CarbonColumn> getMinMaxCacheColumns() {
+      if (null == minMaxCacheColumns) {
+        synchronized (minMaxLock) {
+          if (null == minMaxCacheColumns) {
+            addMinMaxColumns(carbonTable);
+          }
+        }
+      }
       return minMaxCacheColumns;
     }
 

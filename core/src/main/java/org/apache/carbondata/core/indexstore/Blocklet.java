@@ -21,7 +21,7 @@ import java.io.DataOutput;
 import java.io.IOException;
 import java.io.Serializable;
 
-import org.apache.carbondata.core.metadata.schema.table.Writable;
+import org.apache.hadoop.io.Writable;
 
 /**
  * Blocklet
@@ -65,16 +65,36 @@ public class Blocklet implements Writable,Serializable {
     return filePath;
   }
 
+  public void setFilePath(String filePath) {
+    this.filePath = filePath;
+  }
+
   @Override
   public void write(DataOutput out) throws IOException {
-    out.writeUTF(filePath);
-    out.writeUTF(blockletId);
+    if (filePath == null) {
+      out.writeBoolean(false);
+    } else {
+      out.writeBoolean(true);
+      out.writeUTF(filePath);
+    }
+    if (blockletId == null) {
+      out.writeBoolean(false);
+    } else {
+      out.writeBoolean(true);
+      out.writeUTF(blockletId);
+    }
+    out.writeBoolean(compareBlockletIdForObjectMatching);
   }
 
   @Override
   public void readFields(DataInput in) throws IOException {
-    filePath = in.readUTF();
-    blockletId = in.readUTF();
+    if (in.readBoolean()) {
+      filePath = in.readUTF();
+    }
+    if (in.readBoolean()) {
+      blockletId = in.readUTF();
+    }
+    this.compareBlockletIdForObjectMatching = in.readBoolean();
   }
 
   @Override

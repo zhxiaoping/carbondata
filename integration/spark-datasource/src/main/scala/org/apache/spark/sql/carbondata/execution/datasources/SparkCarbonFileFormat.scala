@@ -18,6 +18,7 @@
 package org.apache.spark.sql.carbondata.execution.datasources
 
 import java.net.URI
+import java.util.UUID
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
@@ -78,7 +79,8 @@ class SparkCarbonFileFormat extends FileFormat
 
   /**
    * If user does not provide schema while reading the data then spark calls this method to infer
-   * schema from the carbodata files. It reads the schema present in carbondata files and return it.
+   * schema from the carbondata files.
+   * It reads the schema present in carbondata files and return it.
    */
   override def inferSchema(sparkSession: SparkSession,
       options: Map[String, String],
@@ -152,7 +154,8 @@ class SparkCarbonFileFormat extends FileFormat
           path
         }
         context.getConfiguration.set("carbon.outputformat.writepath", updatedPath)
-        context.getConfiguration.set("carbon.outputformat.taskno", System.nanoTime() + "")
+        context.getConfiguration.set("carbon.outputformat.taskno",
+          UUID.randomUUID().toString.replace("-", ""))
         new CarbonOutputWriter(path, context, dataSchema.fields)
       }
 
@@ -219,6 +222,8 @@ class SparkCarbonFileFormat extends FileFormat
           fieldTypes(i).dataType match {
             case StringType =>
               data(i) = row.getString(i)
+            case BinaryType =>
+              data(i) = row.getBinary(i)
             case d: DecimalType =>
               data(i) = row.getDecimal(i, d.precision, d.scale).toJavaBigDecimal
             case s: StructType =>
@@ -383,7 +388,7 @@ class SparkCarbonFileFormat extends FileFormat
 
       if (file.filePath.endsWith(CarbonTablePath.CARBON_DATA_EXT)) {
         val split = new CarbonInputSplit("null",
-          new Path(new URI(file.filePath)),
+          new Path(new URI(file.filePath)).toString,
           file.start,
           file.length,
           file.locations,
@@ -394,10 +399,10 @@ class SparkCarbonFileFormat extends FileFormat
         split.setDetailInfo(info)
         info.setBlockSize(file.length)
         // Read the footer offset and set.
-        val reader = FileFactory.getFileHolder(FileFactory.getFileType(split.getPath.toString),
+        val reader = FileFactory.getFileHolder(FileFactory.getFileType(split.getFilePath),
           broadcastedHadoopConf.value.value)
         val buffer = reader
-          .readByteBuffer(FileFactory.getUpdatedFilePath(split.getPath.toString),
+          .readByteBuffer(FileFactory.getUpdatedFilePath(split.getFilePath),
             file.length - 8,
             8)
         info.setBlockFooterOffset(buffer.getLong)

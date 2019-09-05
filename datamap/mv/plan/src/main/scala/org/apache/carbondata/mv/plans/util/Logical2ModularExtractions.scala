@@ -17,15 +17,17 @@
 
 package org.apache.carbondata.mv.plans.util
 
-import org.apache.spark.sql.catalyst.catalog._
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference,
-  AttributeSet, Expression, NamedExpression, PredicateHelper}
+import org.apache.spark.sql.catalyst.catalog.{CatalogTable, HiveTableRelation}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, AttributeSet, Expression, NamedExpression, PredicateHelper}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.datasources.LogicalRelation
+import org.apache.spark.util.{CarbonReflectionUtils, SparkUtil}
 
 import org.apache.carbondata.mv.plans.modular.Flags._
 import org.apache.carbondata.mv.plans.modular.JoinEdge
+
+
 
 /**
  * SelectModule is extracted from logical plan of SPJG query.  All join conditions
@@ -130,6 +132,13 @@ object ExtractSelectModule extends PredicateHelper {
             s"unsupported join: \n left child ${ left } " +
             s"\n right child ${ right }")
         }
+
+      // when select * is executed with limit, ColumnPruning rule will remove the project node from
+      // the plan during optimization, so if child of Limit is relation, then make the select node
+      // and make the modular plan
+      case Limit(limitExpr, lr: LogicalRelation) =>
+        (lr.output, lr.output, Nil, Nil, Seq(lr), true, Map.empty, NoFlags, Seq.empty, Seq
+          .empty)
 
       case other =>
         (other.output, other.output, Nil, Nil, Seq(other), false, Map.empty, NoFlags, Seq.empty, Seq
@@ -335,13 +344,13 @@ object ExtractTableModule extends PredicateHelper {
   def unapply(plan: LogicalPlan): Option[ReturnType] = {
     plan match {
       // uncomment for cloudera1 version
-//      case m: CatalogRelation =>
-//        Some(m.tableMeta.database, m.tableMeta.identifier.table, m.output, Nil, NoFlags,
-//          Seq.empty)
-//       uncomment for apache version
+      //      case m: CatalogRelation =>
+      //        Some(m.tableMeta.database, m.tableMeta.identifier.table, m.output, Nil, NoFlags,
+      //          Seq.empty)
+      //       uncomment for apache version
       case m: HiveTableRelation =>
-            Some(m.tableMeta.database, m.tableMeta.identifier.table, m.output, Nil, NoFlags,
-              Seq.empty)
+        Some(m.tableMeta.database, m.tableMeta.identifier.table, m.output, Nil, NoFlags,
+          Seq.empty)
       case l: LogicalRelation =>
         val tableIdentifier = l.catalogTable.map(_.identifier)
         val database = tableIdentifier.map(_.database).flatten.getOrElse(null)
@@ -349,7 +358,23 @@ object ExtractTableModule extends PredicateHelper {
         Some(database, table, l.output, Nil, NoFlags, Seq.empty)
       case l: LocalRelation => // used for unit test
         Some(null, null, l.output, Nil, NoFlags, Seq.empty)
-      case _ => None
+      case _ =>
+        // this check is added as we get MetastoreRelation in spark2.1,
+        // this is removed in later spark version
+        // TODO: this check can be removed once 2.1 support is removed from carbon
+        if (SparkUtil.isSparkVersionEqualTo("2.1") &&
+            plan.getClass.getName.equals("org.apache.spark.sql.hive.MetastoreRelation")) {
+          val catalogTable = CarbonReflectionUtils.getFieldOfCatalogTable("catalogTable", plan)
+            .asInstanceOf[CatalogTable]
+          Some(catalogTable.database,
+            catalogTable.identifier.table,
+            plan.output,
+            Nil,
+            NoFlags,
+            Seq.empty)
+        } else {
+          None
+        }
     }
   }
 }

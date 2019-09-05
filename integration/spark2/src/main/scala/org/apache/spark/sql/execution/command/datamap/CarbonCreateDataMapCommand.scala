@@ -87,13 +87,6 @@ case class CarbonCreateDataMapCommand(
 
     val property = dmProperties.map(x => (x._1.trim, x._2.trim)).asJava
     val javaMap = new java.util.HashMap[String, String](property)
-    // for MV, it is deferred rebuild by default and cannot be non-deferred rebuild
-    if (dataMapSchema.getProviderName.equalsIgnoreCase(DataMapClassProvider.MV.getShortName)) {
-      if (!deferredRebuild) {
-        LOGGER.warn(s"DEFERRED REBUILD is enabled by default for MV datamap $dataMapName")
-      }
-      deferredRebuild = true
-    }
     javaMap.put(DataMapProperty.DEFERRED_REBUILD, deferredRebuild.toString)
     dataMapSchema.setProperties(javaMap)
 
@@ -106,6 +99,27 @@ case class CarbonCreateDataMapCommand(
       throw new MalformedDataMapCommandException(
         s"DEFERRED REBUILD is not supported on this datamap $dataMapName" +
         s" with provider ${dataMapSchema.getProviderName}")
+    }
+
+    if (null != mainTable) {
+      if (mainTable.isChildTable || mainTable.isChildDataMap) {
+        throw new MalformedDataMapCommandException(
+          "Cannot create DataMap on child table " + mainTable.getTableUniqueName)
+      }
+    }
+    if (!dataMapSchema.isIndexDataMap && !dataMapSchema.getProviderName
+      .equalsIgnoreCase(DataMapClassProvider.PREAGGREGATE.getShortName) && !dataMapSchema
+      .getProviderName.equalsIgnoreCase(DataMapClassProvider.TIMESERIES.getShortName)) {
+      if (DataMapStoreManager.getInstance().getAllDataMapSchemas.asScala
+        .exists(_.getDataMapName.equalsIgnoreCase(dataMapSchema.getDataMapName))) {
+        if (!ifNotExistsSet) {
+          throw new MalformedDataMapCommandException(
+            "DataMap with name " + dataMapSchema.getDataMapName + " already exists in storage")
+        }
+        else {
+          return Seq.empty
+        }
+      }
     }
 
     val systemFolderLocation: String = CarbonProperties.getInstance().getSystemFolderLocation
@@ -149,10 +163,15 @@ case class CarbonCreateDataMapCommand(
         dataMapProvider.initMeta(queryString.orNull)
         DataMapStatusManager.disableDataMap(dataMapName)
       case _ =>
+        val createDataMapPreExecutionEvent: CreateDataMapPreExecutionEvent =
+          CreateDataMapPreExecutionEvent(sparkSession,
+            systemFolderLocation, tableIdentifier.orNull)
+        OperationListenerBus.getInstance().fireEvent(createDataMapPreExecutionEvent,
+          operationContext)
         dataMapProvider.initMeta(queryString.orNull)
     }
     val createDataMapPostExecutionEvent: CreateDataMapPostExecutionEvent =
-      new CreateDataMapPostExecutionEvent(sparkSession,
+      CreateDataMapPostExecutionEvent(sparkSession,
         systemFolderLocation, tableIdentifier, dmProviderName)
     OperationListenerBus.getInstance().fireEvent(createDataMapPostExecutionEvent,
       operationContext)
@@ -180,16 +199,26 @@ case class CarbonCreateDataMapCommand(
             operationContext)
         }
       }
+      if (null != dataMapSchema.getRelationIdentifier && !dataMapSchema.isIndexDataMap &&
+          !dataMapSchema.isLazy) {
+        DataMapStatusManager.enableDataMap(dataMapName)
+      }
     }
     Seq.empty
   }
 
   override def undoMetadata(sparkSession: SparkSession, exception: Exception): Seq[Row] = {
     if (dataMapProvider != null) {
+      val table =
+        if (mainTable != null) {
+          Some(TableIdentifier(mainTable.getTableName, Some(mainTable.getDatabaseName)))
+        } else {
+          None
+        }
         CarbonDropDataMapCommand(
           dataMapName,
           true,
-          Some(TableIdentifier(mainTable.getTableName, Some(mainTable.getDatabaseName))),
+          table,
           forceDrop = false).run(sparkSession)
     }
     Seq.empty
