@@ -26,7 +26,7 @@ import org.apache.spark.sql.execution.command._
 import org.apache.spark.sql.execution.command.management.{CarbonAlterTableCompactionCommand, CarbonInsertIntoCommand, CarbonLoadDataCommand, RefreshCarbonTableCommand}
 import org.apache.spark.sql.execution.command.partition.{CarbonAlterTableAddHivePartitionCommand, CarbonAlterTableDropHivePartitionCommand, CarbonShowCarbonPartitionsCommand}
 import org.apache.spark.sql.execution.command.schema._
-import org.apache.spark.sql.execution.command.table.{CarbonDescribeFormattedCommand, CarbonDropTableCommand}
+import org.apache.spark.sql.execution.command.table.{CarbonDescribeFormattedCommand, CarbonDropTableCommand, CarbonTruncateTableCommand}
 import org.apache.spark.sql.hive.execution.command.{CarbonDropDatabaseCommand, CarbonResetCommand, CarbonSetCommand}
 import org.apache.spark.sql.CarbonExpressions.{CarbonDescribeTable => DescribeTableCommand}
 import org.apache.spark.sql.execution.datasources.{RefreshResource, RefreshTable}
@@ -34,9 +34,8 @@ import org.apache.spark.sql.hive.{CarbonRelation, CreateCarbonSourceTableAsSelec
 import org.apache.spark.sql.parser.CarbonSpark2SqlParser
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.util.{CarbonReflectionUtils, FileUtils, SparkUtil}
-
 import org.apache.carbondata.common.exceptions.sql.MalformedCarbonCommandException
-import org.apache.carbondata.common.logging.LogServiceFactory
+import org.apache.carbondata.common.logging.{LogService, LogServiceFactory}
 import org.apache.carbondata.core.metadata.schema.table.CarbonTable
 import org.apache.carbondata.core.util.{CarbonProperties, DataTypeUtil, ThreadLocalSessionInfo}
 import org.apache.carbondata.spark.util.Util
@@ -92,6 +91,14 @@ class DDLStrategy(sparkSession: SparkSession) extends SparkStrategy {
         ExecutedCommandExec(
           CarbonDropTableCommand(ifNotExists, identifier.database,
             identifier.table.toLowerCase)) :: Nil
+      case TruncateTableCommand(tableIdentifier, partitionSpec) =>
+        val isCarbonTable = CarbonEnv.getInstance(sparkSession).carbonMetaStore
+            .tableExists(tableIdentifier)(sparkSession)
+        if (isCarbonTable) {
+          ExecutedCommandExec(CarbonTruncateTableCommand(tableIdentifier, partitionSpec)) :: Nil
+        } else {
+          ExecutedCommandExec(TruncateTableCommand(tableIdentifier, partitionSpec)) :: Nil
+        }
       case createLikeTable: CreateTableLikeCommand =>
         val isCarbonTable = CarbonEnv.getInstance(sparkSession).carbonMetaStore
           .tableExists(createLikeTable.sourceTable)(sparkSession)
@@ -125,9 +132,7 @@ class DDLStrategy(sparkSession: SparkSession) extends SparkStrategy {
             ExecutedCommandExec(alterTable) :: Nil
         } else {
           throw new MalformedCarbonCommandException(
-            String.format("Table or view '%s' not found in database '%s' or not carbon fileformat",
-            altertablemodel.tableName,
-            altertablemodel.dbName.getOrElse("default")))
+            "Operation not allowed : " + altertablemodel.alterSql)
         }
       case colRenameDataTypeChange@CarbonAlterTableColRenameDataTypeChangeCommand(
       alterTableColRenameAndDataTypeChangeModel, _) =>
@@ -148,11 +153,7 @@ class DDLStrategy(sparkSession: SparkSession) extends SparkStrategy {
             ExecutedCommandExec(colRenameDataTypeChange) :: Nil
           }
         } else {
-          throw new MalformedCarbonCommandException(
-            String.format("Table or view '%s' not found in database '%s' or not carbon fileformat",
-              alterTableColRenameAndDataTypeChangeModel.tableName,
-              alterTableColRenameAndDataTypeChangeModel.
-                databaseName.getOrElse("default")))
+          throw new MalformedCarbonCommandException("Unsupported alter operation on hive table")
         }
       case addColumn@CarbonAlterTableAddColumnCommand(alterTableAddColumnsModel) =>
         val isCarbonTable = CarbonEnv.getInstance(sparkSession).carbonMetaStore
