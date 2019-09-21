@@ -1,0 +1,61 @@
+package org.apache.spark.sql.execution.command.table
+
+import org.apache.carbondata.api.CarbonStore
+import org.apache.carbondata.common.exceptions.sql.MalformedCarbonCommandException
+import org.apache.carbondata.core.exception.ConcurrentOperationException
+import org.apache.carbondata.core.statusmanager.{SegmentStatus, SegmentStatusManager}
+import org.apache.carbondata.events.{DeleteSegmentByIdPostEvent, DeleteSegmentByIdPreEvent, OperationContext, OperationListenerBus}
+import org.apache.spark.sql.{CarbonEnv, Row, SparkSession}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
+import org.apache.spark.sql.execution.command.{AtomicRunnableCommand, Checker, DataCommand}
+
+
+case class CarbonTruncateTableCommand(tableIdentifier: TableIdentifier, partitionSpec: Option[TablePartitionSpec]) extends DataCommand{
+  override def processData(sparkSession: SparkSession): Seq[Row] = {
+    Checker.validateTableExists(tableIdentifier.database, tableIdentifier.table, sparkSession)
+    val carbonTable = CarbonEnv.getCarbonTable(tableIdentifier.database, tableIdentifier.table)(sparkSession)
+    val rows: Seq[Row] = CarbonStore.showSegments(None, carbonTable.getTablePath, false)
+    val loadIds: Seq[String] = rows.filter(_(1) == SegmentStatus.SUCCESS.getMessage).
+      map(_(0).asInstanceOf[String])
+    setAuditTable(carbonTable)
+    setAuditInfo(Map("segmentIds" -> loadIds.mkString(", ")))
+    if(partitionSpec.isDefined) {
+      throw new MalformedCarbonCommandException("Operation not allowed: TRUNCATE TABLE ... PARTITION is not supported")
+    }
+    if (!carbonTable.getTableInfo.isTransactionalTable) {
+      throw new MalformedCarbonCommandException("Unsupported operation on non transactional table")
+    }
+
+    // if insert overwrite in progress, do not allow delete segment
+    if (SegmentStatusManager.isOverwriteInProgressInTable(carbonTable)) {
+      throw new ConcurrentOperationException(carbonTable, "insert overwrite", "delete segment")
+    }
+
+    val operationContext = new OperationContext
+    val deleteSegmentByIdPreEvent: DeleteSegmentByIdPreEvent =
+      DeleteSegmentByIdPreEvent(carbonTable,
+        loadIds,
+        sparkSession)
+    OperationListenerBus.getInstance.fireEvent(deleteSegmentByIdPreEvent, operationContext)
+    if (loadIds.size > 0)
+      CarbonStore.deleteLoadById(
+        loadIds,
+        CarbonEnv.getDatabaseName(tableIdentifier.database)(sparkSession),
+        tableIdentifier.table,
+        carbonTable
+      )
+    val dbName =
+    CarbonStore.cleanFiles(carbonTable.getDatabaseName, carbonTable.getTableName, carbonTable.getTablePath, carbonTable,
+      false, None
+    )
+
+    val deleteSegmentPostEvent: DeleteSegmentByIdPostEvent =
+      DeleteSegmentByIdPostEvent(carbonTable,
+        loadIds,
+        sparkSession)
+    OperationListenerBus.getInstance.fireEvent(deleteSegmentPostEvent, operationContext)
+    Seq.empty
+  }
+  override protected def opName: String = "TRUNCATE TABLE"
+}
